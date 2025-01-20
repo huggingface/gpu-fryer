@@ -4,7 +4,8 @@ GPU fryer is a tool to stress test GPUs and detect any abnormal thermal throttli
 It is especially useful to test GPUs running ML inference or training workloads for which
 performances are dictated by the slowest GPU in the system.
 
-We use it at [Hugging Face](https://huggingface.co) 🤗 to monitor our HPC clusters and ensure that all GPUs are running at
+We use it at [Hugging Face](https://huggingface.co) 🤗 to monitor our HPC clusters and ensure that all GPUs are running
+at
 peak performance.
 
 ![cooking.jpg](../assets/cooking.jpg)
@@ -37,4 +38,8 @@ $ cargo install gpu-fryer
 ## How it works
 
 GPU fryer creates two 8192x8192 matrix and performs a matrix multiplication using CUBLAS.
-Test allocates 95% of the GPU memory to write results in a ring buffer fashion.  
+Test allocates 95% of the GPU memory to write results in a ring buffer fashion.
+
+## Acknowledgements
+
+The awesome [GPU Burn](https://github.com/wilicc/gpu-burn), very similar tool but looking at computational errors.
