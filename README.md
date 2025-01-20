@@ -8,7 +8,7 @@ We use it at [Hugging Face](https://huggingface.co) 🤗 to monitor our HPC clus
 at
 peak performance.
 
-![cooking.jpg](../assets/cooking.jpg)
+![cooking.jpg](./assets/cooking.jpg)
 
 ## Usage
 
