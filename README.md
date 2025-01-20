@@ -12,13 +12,18 @@ peak performance.
 
 ## Usage
 
-```bash
+```
 $ gpu-fryer 60  # Run the test for 60 seconds
+...
+GPU #7:  51494 Gflops/s (min: 50577.53, max: 51677.05, dev: 51493.79)
+         Temperature: 48.83°C (min: 47.00, max: 50.00)
+         Throttling HW: false, Thermal SW: false, Thermal HW: false
+All GPUs seem healthy
 ```
 
 GPU fryer relies on NVIDIA's CUDA toolkit to run the stress test, so make sure
 that your PATH includes the CUDA libs.
-NVML is used to monitor the GPU's temperature and performance, in case of non default
+NVML is used to monitor the GPU's temperature and throttling, in case of non default
 installations, you can use the `--nvml-lib-path` flag to specify the path to `libnvidia-ml.so`.
 
 GPU fryer checks for homogeneous performance across all GPUs in the system (if multiple GPUs are present) and reports
