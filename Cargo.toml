@@ -1,12 +1,12 @@
 [package]
-name = "gpu-burn"
+name = "gpu-fryer"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 anyhow = "1.0.95"
+clap = { version = "4.5.26", features = ["derive"] }
 cudarc = { version = "0.13.0", features = ["cuda-12060"] }
-log = "0.4.25"
 nvml-wrapper = "0.10.0"
 rand = { version = "0.8.5", features = ["small_rng"] }
 tokio = { version = "1.42", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
