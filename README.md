@@ -21,6 +21,26 @@ GPU #7:  51494 Gflops/s (min: 50577.53, max: 51677.05, dev: 51493.79)
 All GPUs seem healthy
 ```
 
+```
+Usage: gpu-fryer [OPTIONS] [DURATION_SECS]
+
+Arguments:
+  [DURATION_SECS]  Duration in seconds to burn the GPUs [default: 60]
+
+Options:
+      --nvml-lib-path <NVML_LIB_PATH>
+          Path to NVIDIA Management Library (libnvidia-ml.so) [default: /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1]
+      --tolerate-software-throttling
+          Tolerate software throttling if the TFLOPS are in the acceptable range
+      --tflops-tolerance <TFLOPS_TOLERANCE>
+          TFLOPS tolerance (%) from the average If the TFLOPS are within this range, test pass [default: 10]
+  -h, --help
+          Print help
+  -V, --version
+          Print version
+```
+
+
 GPU fryer relies on NVIDIA's CUDA toolkit to run the stress test, so make sure
 that your PATH includes the CUDA libs.
 NVML is used to monitor the GPU's temperature and throttling, in case of non default

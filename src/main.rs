@@ -33,6 +33,13 @@ struct Args {
     /// Path to NVIDIA Management Library (libnvidia-ml.so)
     #[clap(long, default_value = "/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1")]
     nvml_lib_path: String,
+    /// Tolerate software throttling if the TFLOPS are in the acceptable range
+    #[clap(long, default_value = "false")]
+    tolerate_software_throttling: bool,
+    /// TFLOPS tolerance (%) from the average
+    /// If the TFLOPS are within this range, test pass
+    #[clap(long, default_value = "10")]
+    tflops_tolerance: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -99,6 +106,14 @@ impl Default for BurnResult {
     }
 }
 
+#[derive(Debug, Clone)]
+struct Config {
+    duration_secs: u64,
+    nvml_lib_path: String,
+    tflops_tolerance: f64,
+    tolerate_software_throttling: bool,
+}
+
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
@@ -106,7 +121,19 @@ async fn main() {
         eprintln!("Duration must be at least {} seconds", MIN_DURATION_SECS);
         std::process::exit(1);
     }
-    match run(args.duration_secs, args.nvml_lib_path).await {
+    if args.tflops_tolerance < 0.0 || args.tflops_tolerance > 100.0 {
+        eprintln!("TFLOPS tolerance must be between 0 and 100");
+        std::process::exit(1);
+    }
+
+    let config = Config {
+        duration_secs: args.duration_secs,
+        nvml_lib_path: args.nvml_lib_path.clone(),
+        tflops_tolerance: args.tflops_tolerance,
+        tolerate_software_throttling: args.tolerate_software_throttling,
+    };
+
+    match run(config).await {
         Ok(_) => {}
         Err(e) => {
             eprintln!("Error: {}", e);
@@ -127,7 +154,7 @@ fn uuid_to_string(uuid: sys::CUuuid) -> String {
     )
 }
 
-async fn run(duration_secs: u64, nvml_lib_path: String) -> anyhow::Result<()> {
+async fn run(config: Config) -> anyhow::Result<()> {
     let mut gpus = detect_gpus()?;
     if gpus.is_empty() {
         return Err(anyhow::anyhow!("No GPUs detected"));
@@ -175,13 +202,22 @@ async fn run(duration_secs: u64, nvml_lib_path: String) -> anyhow::Result<()> {
     let stop_clone = stop.clone();
     let gpus_healthy = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let gpus_healthy_clone = gpus_healthy.clone();
-    let nvml = Nvml::builder().lib_path(nvml_lib_path.as_ref()).init().expect("Unable to initialize NVML. Check if the NVIDIA driver is installed and the NVIDIA Management Library is available (libnvidia-ml.so).");
+    let nvml = Nvml::builder().lib_path(config.nvml_lib_path.as_ref()).init().expect("Unable to initialize NVML. Check if the NVIDIA driver is installed and the NVIDIA Management Library is available (libnvidia-ml.so).");
+    let config_clone = config.clone();
     let t = tokio::spawn(async move {
-        report_progress(gpus.len(), nvml, rx, stop_clone, gpus_healthy_clone).await;
+        report_progress(
+            config_clone,
+            gpus.len(),
+            nvml,
+            rx,
+            stop_clone,
+            gpus_healthy_clone,
+        )
+        .await;
     });
     handles.push(t);
     // burn the GPU for 10 seconds
-    tokio::time::sleep(std::time::Duration::from_secs(duration_secs)).await;
+    tokio::time::sleep(std::time::Duration::from_secs(config.duration_secs)).await;
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     drop(tx);
     for handle in handles {
@@ -213,6 +249,7 @@ fn poll_throttling(nvml: &Nvml, gpu_count: usize) -> anyhow::Result<Vec<Throttle
 }
 
 async fn report_progress(
+    config: Config,
     gpu_count: usize,
     nvml: Nvml,
     mut rx: Receiver<(usize, usize)>,
@@ -319,7 +356,11 @@ async fn report_progress(
         );
     }
 
-    let (healthy, reasons) = are_gpus_healthy(burn_results);
+    let (healthy, reasons) = are_gpus_healthy(
+        burn_results,
+        config.tflops_tolerance,
+        config.tolerate_software_throttling,
+    );
     if healthy {
         println!("All GPUs seem healthy");
     } else {
@@ -331,22 +372,32 @@ async fn report_progress(
     gpus_healthy.store(healthy, std::sync::atomic::Ordering::Relaxed);
 }
 
-fn are_gpus_healthy(burn_results: Vec<BurnResult>) -> (bool, Vec<String>) {
+fn are_gpus_healthy(
+    burn_results: Vec<BurnResult>,
+    tflops_tolerance: f64,
+    tolerate_software_throttling: bool,
+) -> (bool, Vec<String>) {
     let mut reasons = vec![];
-    // find if we have more than 10% difference in average flops between GPUs
     let mut avg_flops = 0.0;
     for r in burn_results.iter() {
         avg_flops += r.flops_avg();
     }
     avg_flops /= burn_results.len() as f64;
     for r in burn_results.iter() {
-        if (r.flops_avg() - avg_flops).abs() > 0.1 * avg_flops {
+        let mut low_flops = false;
+        // if we have less than tflops_tolerance difference in average flops between GPUs
+        if (r.flops_avg() - avg_flops).abs() > tflops_tolerance / 100. * avg_flops {
             reasons.push(format!("GPU {} - ", r.gpu_idx) + GPU_FLOPS_REASON);
+            low_flops = true;
         }
-    }
-    // find if we have any throttling
-    for r in burn_results.iter() {
+        // if we have any throttling
         if r.is_throttled() {
+            if !low_flops
+                && tolerate_software_throttling
+                && (r.throttling_thermal_hw == 0 && r.throttling_hw == 0)
+            {
+                continue;
+            }
             reasons.push(format!("GPU {} - ", r.gpu_idx) + GPU_THROTTLING_REASON);
         }
     }
