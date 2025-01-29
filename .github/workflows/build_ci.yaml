@@ -1,0 +1,32 @@
+name: Build gpu-fryer
+
+on:
+  workflow_dispatch:
+  workflow_call:
+  push:
+    branches:
+      - 'main'
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - "main"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust checks
+    permissions:
+      pull-requests: write
+      contents: read
+    uses: ./.github/workflows/rust.yaml
+  build:
+    permissions:
+      packages: write
+      contents: read
+    name: Build and push docker image
+    uses: ./.github/workflows/build.yaml
+    needs: rust

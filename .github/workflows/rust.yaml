@@ -1,0 +1,54 @@
+name: Rust checks
+
+on:
+  workflow_call:
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  fmt:
+    name: Rustfmt
+    runs-on:
+      group: aws-general-8-plus
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: nightly
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on:
+      group: aws-general-8-plus
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: clippy
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        env:
+          cache-name: cache-dependencies
+        with:
+          path: |
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
+            ~/.cargo/bin
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ./target
+          key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ hashFiles('app/Cargo.lock') }}
+      - uses: giraffate/clippy-action@v1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          clippy_flags: -- -Dwarnings
+          tool_name: clippy-action-output
+          fail_on_error: true
+          filter_mode: file
+          level: info
+
