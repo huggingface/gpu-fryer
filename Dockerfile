@@ -1,4 +1,4 @@
-FROM nvidia/cuda:12.1.0-devel-ubuntu20.04
+FROM nvidia/cuda:12.1.0-devel-ubuntu20.04 AS builder
 RUN apt-get update && apt-get install -y \
     curl \
     git \
@@ -7,3 +7,11 @@ RUN apt-get update && apt-get install -y \
 # install rust
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 # It will be at /root/.cargo/bin/rustc
+ENV PATH="/root/.cargo/bin:${PATH}"
+WORKDIR /app
+COPY . .
+RUN cargo build --release
+
+FROM nvidia/cuda:12.1.0-devel-ubuntu20.04
+COPY --from=builder /app/target/release/gpu-fryer /usr/local/bin/gpu-fryer
+ENTRYPOINT ["gpu-fryer"]
