@@ -48,7 +48,7 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           clippy_flags: -- -Dwarnings
           tool_name: clippy-action-output
-          fail_level: any
+          fail_on_error: true
           filter_mode: file
           level: info
 

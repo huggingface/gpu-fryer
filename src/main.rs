@@ -24,6 +24,8 @@ const GPU_THROTTLING_REASON: &str =
 const GPU_FLOPS_REASON: &str =
     "GPU is not performing as expected. Check the flops values and temperatures";
 
+type AllocBufferTuple = (CudaSlice<f32>, CudaSlice<f32>, Vec<CudaSlice<f32>>);
+
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 struct Args {
@@ -194,7 +196,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
         let t = tokio::spawn(async move {
             burn_gpu(gpu.ordinal(), a, b, tx, stop)
                 .await
-                .expect(format!("Unable to burn GPU #{}", gpu.ordinal()).as_str());
+                .unwrap_or_else(|_| panic!("Unable to burn GPU #{}", gpu.ordinal()));
         });
         handles.push(t);
     }
@@ -232,9 +234,9 @@ async fn run(config: Config) -> anyhow::Result<()> {
 
 fn poll_temperatures(nvml: &Nvml, gpu_count: usize) -> anyhow::Result<Vec<usize>> {
     let mut temps = vec![0usize; gpu_count];
-    for i in 0..gpu_count {
+    for (i, temp) in temps.iter_mut().enumerate().take(gpu_count) {
         let gpu = nvml.device_by_index(i as u32)?;
-        temps[i] = gpu.temperature(Gpu)? as usize;
+        *temp = gpu.temperature(Gpu)? as usize;
     }
     Ok(temps)
 }
@@ -259,9 +261,7 @@ async fn report_progress(
     // Use a fixed interval for reporting
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
 
-    let mut burn_results = (0..gpu_count)
-        .map(|i| BurnResult::new(i))
-        .collect::<Vec<_>>();
+    let mut burn_results = (0..gpu_count).map(BurnResult::new).collect::<Vec<_>>();
 
     let mut tick = 0;
     while !stop.load(std::sync::atomic::Ordering::Relaxed) {
@@ -427,8 +427,8 @@ async fn burn_gpu(
     let handle = cublas::safe::CudaBlas::new(gpu)?;
     let mut i = 0;
     while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-        for mut out in out_slices_gpu.iter_mut() {
-            compute(&handle, &a_gpu, &b_gpu, &mut out)?;
+        for out in out_slices_gpu.iter_mut() {
+            compute(&handle, &a_gpu, &b_gpu, out)?;
             i += 1;
             _ = tx.send((gpu_idx, 1));
         }
@@ -448,7 +448,7 @@ fn alloc_buffers(
     a: Vec<f32>,
     b: Vec<f32>,
     num_out_slices: usize,
-) -> anyhow::Result<(CudaSlice<f32>, CudaSlice<f32>, Vec<CudaSlice<f32>>)> {
+) -> anyhow::Result<AllocBufferTuple> {
     let a_gpu = gpu.htod_copy(a)?;
     let b_gpu = gpu.htod_copy(b)?;
     let mut out_slices = vec![];
@@ -478,7 +478,7 @@ fn compute(
         ldc: SIZE as i32,
     };
     unsafe {
-        let _res = handle.gemm(cfg, a, b, out)?;
+        handle.gemm(cfg, a, b, out)?;
     }
     Ok(())
 }
