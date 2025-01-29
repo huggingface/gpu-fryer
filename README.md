@@ -10,6 +10,14 @@ peak performance.
 
 ![cooking.jpg](./assets/cooking.jpg)
 
+## Quickstart
+
+Use Docker:
+
+```bash
+$ docker run --gpus all ghcr.io/huggingface/gpu-fryer:latest 60
+```
+
 ## Usage
 
 ```
@@ -39,7 +47,6 @@ Options:
   -V, --version
           Print version
 ```
-
 
 GPU fryer relies on NVIDIA's CUDA toolkit to run the stress test, so make sure
 that your PATH includes the CUDA libs.
