@@ -15,7 +15,7 @@ peak performance.
 Use Docker:
 
 ```bash
-$ docker run --gpus all ghcr.io/huggingface/gpu-fryer:latest 60
+docker run --gpus all ghcr.io/huggingface/gpu-fryer:latest 60
 ```
 
 ## Usage
