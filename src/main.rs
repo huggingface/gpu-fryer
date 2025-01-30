@@ -379,10 +379,12 @@ fn are_gpus_healthy(
 ) -> (bool, Vec<String>) {
     let mut reasons = vec![];
     // acceptable_flops is tflops_tolerance% lower than best gpu avg flops
-    let mut acceptable_flops: f64 = 0.;
-    for r in burn_results.iter() {
-        acceptable_flops = acceptable_flops.max(r.flops_avg() * (100. - tflops_tolerance) / 100.);
-    }
+    let acceptable_flops: f64 = burn_results
+        .iter()
+        .map(|r| r.flops_avg())
+        .fold(0., |max, avg| {
+            max.max(avg * (100. - tflops_tolerance) / 100.)
+        });
     for r in burn_results.iter() {
         let mut low_flops = false;
         if r.flops_avg() < acceptable_flops {
