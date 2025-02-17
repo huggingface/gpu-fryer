@@ -11,6 +11,7 @@ use rand::rngs::SmallRng;
 use rand::RngCore;
 use rand::SeedableRng;
 use std::sync::Arc;
+use tokio::signal;
 use tokio::sync::mpsc::{
     unbounded_channel, UnboundedReceiver as Receiver, UnboundedSender as Sender,
 };
@@ -186,6 +187,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
 
     let (tx, rx) = unbounded_channel::<(usize, usize)>();
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    tokio::spawn(shutdown_signal(stop.clone()));
     let mut handles = Vec::new();
     for gpu in gpus.clone() {
         let tx = tx.clone();
@@ -218,7 +220,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
         .await;
     });
     handles.push(t);
-    // burn the GPU for 10 seconds
+    // burn the GPU for given duration
     tokio::time::sleep(std::time::Duration::from_secs(config.duration_secs)).await;
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     drop(tx);
@@ -370,6 +372,7 @@ async fn report_progress(
         }
     }
     gpus_healthy.store(healthy, std::sync::atomic::Ordering::Relaxed);
+    println!("Freeing GPUs...");
 }
 
 fn are_gpus_healthy(
@@ -492,4 +495,26 @@ fn detect_gpus() -> anyhow::Result<Vec<Arc<CudaDevice>>> {
         devices.push(dev);
     }
     Ok(devices)
+}
+
+async fn shutdown_signal(stop: Arc<std::sync::atomic::AtomicBool>) {
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to hook signal handler")
+            .recv()
+            .await;
+    };
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
 }

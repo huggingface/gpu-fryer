@@ -9,4 +9,4 @@ clap = { version = "4.5.26", features = ["derive"] }
 cudarc = { version = "0.13.0", features = ["cuda-12060"] }
 nvml-wrapper = "0.10.0"
 rand = { version = "0.8.5", features = ["small_rng"] }
-tokio = { version = "1.42", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
+tokio = { version = "1.42", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "signal"] }
