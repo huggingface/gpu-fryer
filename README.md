@@ -41,7 +41,7 @@ Options:
       --tolerate-software-throttling
           Tolerate software throttling if the TFLOPS are in the acceptable range
       --tflops-tolerance <TFLOPS_TOLERANCE>
-          TFLOPS tolerance (%) from the average If the TFLOPS are within this range, test pass [default: 10]
+          TFLOPS tolerance (%) compared to best GPU If the TFLOPS are within `tflops_tolerance`% of the best performing GPU, test will pass [default: 10]
   -h, --help
           Print help
   -V, --version

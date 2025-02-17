@@ -38,8 +38,8 @@ struct Args {
     /// Tolerate software throttling if the TFLOPS are in the acceptable range
     #[clap(long, default_value = "false")]
     tolerate_software_throttling: bool,
-    /// TFLOPS tolerance (%) from the average
-    /// If the TFLOPS are within this range, test pass
+    /// TFLOPS tolerance (%) compared to best GPU
+    /// If the TFLOPS are within `tflops_tolerance`% of the best performing GPU, test will pass
     #[clap(long, default_value = "10")]
     tflops_tolerance: f64,
 }
@@ -378,15 +378,16 @@ fn are_gpus_healthy(
     tolerate_software_throttling: bool,
 ) -> (bool, Vec<String>) {
     let mut reasons = vec![];
-    let mut avg_flops = 0.0;
-    for r in burn_results.iter() {
-        avg_flops += r.flops_avg();
-    }
-    avg_flops /= burn_results.len() as f64;
+    // acceptable_flops is tflops_tolerance% lower than best gpu avg flops
+    let acceptable_flops: f64 = burn_results
+        .iter()
+        .map(|r| r.flops_avg())
+        .fold(0., |max, avg| {
+            max.max(avg * (100. - tflops_tolerance) / 100.)
+        });
     for r in burn_results.iter() {
         let mut low_flops = false;
-        // if we have less than tflops_tolerance difference in average flops between GPUs
-        if (r.flops_avg() - avg_flops).abs() > tflops_tolerance / 100. * avg_flops {
+        if r.flops_avg() < acceptable_flops {
             reasons.push(format!("GPU {} - ", r.gpu_idx) + GPU_FLOPS_REASON);
             low_flops = true;
         }
