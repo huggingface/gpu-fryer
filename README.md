@@ -75,6 +75,13 @@ $ cargo install gpu-fryer
 GPU fryer creates two 8192x8192 matrix and performs a matrix multiplication using CUBLAS.
 Test allocates 95% of the GPU memory to write results in a ring buffer fashion.
 
+If GPU is BF16 capable, it will use BF16 precision instead of FP32 to stress the Tensor Cores.
+
+With a 8xNVIDIA H100 80GB HBM3 system, we get the following results:
+
+![utilization.png](assets/utilization.png)
+![tensorcores.png](assets/tensorcores.png)
+
 ## Acknowledgements
 
 The awesome [GPU Burn](https://github.com/wilicc/gpu-burn), very similar tool but looking at computational errors.
