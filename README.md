@@ -42,10 +42,12 @@ Options:
           Tolerate software throttling if the TFLOPS are in the acceptable range
       --tflops-tolerance <TFLOPS_TOLERANCE>
           TFLOPS tolerance (%) compared to best GPU If the TFLOPS are within `tflops_tolerance`% of the best performing GPU, test will pass [default: 10]
-  -h, --help
-          Print help
-  -V, --version
-          Print version
+      --use-bf16 <USE_BF16>
+          Use BF16 precision instead of FP32. GPU must support BF16 type. If unset, will use BF16 only if all GPUs support it [possible values: true, false]
+      -h, --help
+              Print help
+      -V, --version
+              Print version
 ```
 
 GPU fryer relies on NVIDIA's CUDA toolkit to run the stress test, so make sure
@@ -57,9 +59,10 @@ GPU fryer checks for homogeneous performance across all GPUs in the system (if m
 any performance degradation or thermal throttling.
 There is currently no absolute performance metric. For reference:
 
-| GPU                   | TFLOPS |
-|-----------------------|--------|
-| NVIDIA H100 80GB HBM3 | ~51    |
+| GPU                   | TFLOPS | Precision |
+|-----------------------|--------|-----------|
+| NVIDIA H100 80GB HBM3 | ~51    | FP32      |
+| NVIDIA H100 80GB HBM3 | ~676   | BF16      |
 
 ## Installation
 
@@ -71,6 +74,13 @@ $ cargo install gpu-fryer
 
 GPU fryer creates two 8192x8192 matrix and performs a matrix multiplication using CUBLAS.
 Test allocates 95% of the GPU memory to write results in a ring buffer fashion.
+
+If GPU is BF16 capable, it will use BF16 precision instead of FP32 to stress the Tensor Cores.
+
+With a 8xNVIDIA H100 80GB HBM3 system, we get the following results:
+
+![utilization.png](assets/utilization.png)
+![tensorcores.png](assets/tensorcores.png)
 
 ## Acknowledgements
 

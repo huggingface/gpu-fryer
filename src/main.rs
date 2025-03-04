@@ -1,15 +1,16 @@
 use clap::Parser;
 use cudarc::cublas;
 use cudarc::cublas::sys::cublasOperation_t;
-use cudarc::cublas::{Gemm, GemmConfig};
+use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
 use cudarc::driver::result::mem_get_info;
-use cudarc::driver::{sys, CudaDevice, CudaSlice};
+use cudarc::driver::{sys, CudaDevice, CudaSlice, DeviceRepr, ValidAsZeroBits};
 use nvml_wrapper::bitmasks::device::ThrottleReasons;
 use nvml_wrapper::enum_wrappers::device::TemperatureSensor::Gpu;
 use nvml_wrapper::Nvml;
 use rand::rngs::SmallRng;
 use rand::RngCore;
 use rand::SeedableRng;
+use std::fmt::Debug;
 use std::sync::Arc;
 use tokio::signal;
 use tokio::sync::mpsc::{
@@ -25,7 +26,7 @@ const GPU_THROTTLING_REASON: &str =
 const GPU_FLOPS_REASON: &str =
     "GPU is not performing as expected. Check the flops values and temperatures";
 
-type AllocBufferTuple = (CudaSlice<f32>, CudaSlice<f32>, Vec<CudaSlice<f32>>);
+type AllocBufferTuple<T> = (CudaSlice<T>, CudaSlice<T>, Vec<CudaSlice<T>>);
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
@@ -43,6 +44,9 @@ struct Args {
     /// If the TFLOPS are within `tflops_tolerance`% of the best performing GPU, test will pass
     #[clap(long, default_value = "10")]
     tflops_tolerance: f64,
+    /// Use BF16 precision instead of FP32. GPU must support BF16 type. If unset, will use BF16 only if all GPUs support it.
+    #[clap(long)]
+    use_bf16: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -115,6 +119,25 @@ struct Config {
     nvml_lib_path: String,
     tflops_tolerance: f64,
     tolerate_software_throttling: bool,
+    use_bf16: Option<bool>,
+}
+
+trait VariablePrecisionFloat:
+    Copy + Debug + Send + Sync + Unpin + DeviceRepr + ValidAsZeroBits + 'static
+{
+    fn from_f32(f: f32) -> Self;
+}
+
+impl VariablePrecisionFloat for f32 {
+    fn from_f32(f: f32) -> Self {
+        f
+    }
+}
+
+impl VariablePrecisionFloat for half::bf16 {
+    fn from_f32(f: f32) -> Self {
+        half::bf16::from_f32(f)
+    }
 }
 
 #[tokio::main]
@@ -134,6 +157,7 @@ async fn main() {
         nvml_lib_path: args.nvml_lib_path.clone(),
         tflops_tolerance: args.tflops_tolerance,
         tolerate_software_throttling: args.tolerate_software_throttling,
+        use_bf16: args.use_bf16,
     };
 
     match run(config).await {
@@ -173,15 +197,45 @@ async fn run(config: Config) -> anyhow::Result<()> {
         );
     }
 
+    let use_bf16 = if let Some(requested_bf16) = config.use_bf16 {
+        // If explicitly requested, check if all GPUs support it
+        let all_support_bf16 = gpus.iter().all(|gpu| supports_bf16(gpu).unwrap_or(false));
+        if requested_bf16 && !all_support_bf16 {
+            return Err(anyhow::anyhow!(
+                "BF16 was explicitly requested but not all GPUs support it. Remove the --use-bf16 flag"
+            ));
+        }
+        requested_bf16
+    } else {
+        // Auto-detect: use BF16 only if all GPUs support it
+        gpus.iter().all(|gpu| supports_bf16(gpu).unwrap_or(false))
+    };
+
+    println!("Using {}", if use_bf16 { "BF16" } else { "FP32" });
+
+    if use_bf16 {
+        run_with_precision::<half::bf16>(config, gpus).await
+    } else {
+        run_with_precision::<f32>(config, gpus).await
+    }
+}
+
+async fn run_with_precision<T: VariablePrecisionFloat>(
+    config: Config,
+    gpus: Vec<Arc<CudaDevice>>,
+) -> anyhow::Result<()>
+where
+    CudaBlas: Gemm<T>,
+{
     // create 2 matrix with random values
     println!("Creating random matrices");
     // use SmallRng to create random values, we don't need cryptographic security but we need speed
     let mut small_rng = SmallRng::from_entropy();
-    let mut a = vec![0.0f32; SIZE * SIZE];
-    let mut b = vec![0.0f32; SIZE * SIZE];
+    let mut a = vec![T::from_f32(0.0); SIZE * SIZE];
+    let mut b = vec![T::from_f32(0.0); SIZE * SIZE];
     for i in 0..SIZE * SIZE {
-        a[i] = small_rng.next_u32() as f32;
-        b[i] = small_rng.next_u32() as f32;
+        a[i] = T::from_f32(small_rng.next_u32() as f32);
+        b[i] = T::from_f32(small_rng.next_u32() as f32);
     }
     println!("Matrices created");
 
@@ -221,9 +275,17 @@ async fn run(config: Config) -> anyhow::Result<()> {
     });
     handles.push(t);
     // burn the GPU for given duration
-    tokio::time::sleep(std::time::Duration::from_secs(config.duration_secs)).await;
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    drop(tx);
+    let wait = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        let mut tick = 0;
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) && tick < config.duration_secs {
+            interval.tick().await;
+            tick += 1;
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        drop(tx);
+    });
+    handles.push(wait);
     for handle in handles {
         handle.await.expect("Thread panicked");
     }
@@ -250,6 +312,16 @@ fn poll_throttling(nvml: &Nvml, gpu_count: usize) -> anyhow::Result<Vec<Throttle
         throttling.push(gpu.current_throttle_reasons()?);
     }
     Ok(throttling)
+}
+
+fn supports_bf16(gpu: &Arc<CudaDevice>) -> anyhow::Result<bool> {
+    Ok(
+        gpu.attribute(sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)?
+            >= 8
+            && gpu.attribute(
+                sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+            )? >= 0,
+    )
 }
 
 async fn report_progress(
@@ -408,13 +480,16 @@ fn are_gpus_healthy(
     (reasons.is_empty(), reasons)
 }
 
-async fn burn_gpu(
+async fn burn_gpu<T: VariablePrecisionFloat>(
     gpu_idx: usize,
-    a: Vec<f32>,
-    b: Vec<f32>,
+    a: Vec<T>,
+    b: Vec<T>,
     tx: Sender<(usize, usize)>,
     stop: Arc<std::sync::atomic::AtomicBool>,
-) -> anyhow::Result<usize> {
+) -> anyhow::Result<usize>
+where
+    CudaBlas: Gemm<T>,
+{
     let gpu = CudaDevice::new(gpu_idx)?;
     // compute the output matrix size
     let (free_mem, _) = get_gpu_memory(gpu.clone())?;
@@ -425,8 +500,8 @@ async fn burn_gpu(
         mem_to_use / 1024 / 1024,
         free_mem / 1024 / 1024
     );
-    let iters =
-        (mem_to_use - 2 * SIZE * SIZE * size_of::<f32>()) / (SIZE * SIZE * size_of::<f32>());
+    let iters = (mem_to_use - 2 * SIZE * SIZE * get_memory_size::<T>())
+        / (SIZE * SIZE * get_memory_size::<T>());
     let (a_gpu, b_gpu, mut out_slices_gpu) = alloc_buffers(gpu.clone(), a, b, iters)?;
     let handle = cublas::safe::CudaBlas::new(gpu)?;
     let mut i = 0;
@@ -441,44 +516,51 @@ async fn burn_gpu(
     Ok(i)
 }
 
+fn get_memory_size<T>() -> usize {
+    size_of::<T>()
+}
+
 fn get_gpu_memory(gpu: Arc<CudaDevice>) -> anyhow::Result<(usize, usize)> {
     CudaDevice::new(gpu.ordinal())?;
     let mem_info = mem_get_info()?;
     Ok(mem_info)
 }
 
-fn alloc_buffers(
+fn alloc_buffers<T: VariablePrecisionFloat>(
     gpu: Arc<CudaDevice>,
-    a: Vec<f32>,
-    b: Vec<f32>,
+    a: Vec<T>,
+    b: Vec<T>,
     num_out_slices: usize,
-) -> anyhow::Result<AllocBufferTuple> {
+) -> anyhow::Result<AllocBufferTuple<T>> {
     let a_gpu = gpu.htod_copy(a)?;
     let b_gpu = gpu.htod_copy(b)?;
     let mut out_slices = vec![];
     for _ in 0..num_out_slices {
-        let out = gpu.alloc_zeros::<f32>(SIZE * SIZE)?;
+        let out = gpu.alloc_zeros::<T>(SIZE * SIZE)?;
         out_slices.push(out);
     }
     Ok((a_gpu, b_gpu, out_slices))
 }
 
-fn compute(
+fn compute<T: VariablePrecisionFloat>(
     handle: &cublas::safe::CudaBlas,
-    a: &CudaSlice<f32>,
-    b: &CudaSlice<f32>,
-    out: &mut CudaSlice<f32>,
-) -> anyhow::Result<()> {
+    a: &CudaSlice<T>,
+    b: &CudaSlice<T>,
+    out: &mut CudaSlice<T>,
+) -> anyhow::Result<()>
+where
+    CudaBlas: Gemm<T>,
+{
     let cfg = GemmConfig {
         transa: cublasOperation_t::CUBLAS_OP_N,
         transb: cublasOperation_t::CUBLAS_OP_N,
         m: SIZE as i32,
         n: SIZE as i32,
         k: SIZE as i32,
-        alpha: 1.0,
+        alpha: T::from_f32(1.0),
         lda: SIZE as i32,
         ldb: SIZE as i32,
-        beta: 0.0,
+        beta: T::from_f32(0.0),
         ldc: SIZE as i32,
     };
     unsafe {
