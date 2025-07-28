@@ -152,6 +152,9 @@ async fn main() {
         std::process::exit(1);
     }
 
+    // detect architecture (x86_64 or aarch64) and set NVML library path accordingly
+
+
     let config = Config {
         duration_secs: args.duration_secs,
         nvml_lib_path: args.nvml_lib_path.clone(),
