@@ -345,6 +345,10 @@ async fn report_progress(
         while let Ok(ops) = rx.try_recv() {
             nops[ops.0] += ops.1; // Accumulate operations
         }
+        // If no operations were received, continue to the next tick (means no work done yet, still loading data)
+        if nops.iter().all(|&x| x == 0) {
+            continue;
+        }
         for i in 0..gpu_count {
             let flops = nops[i] * SIZE * SIZE * SIZE * 2;
             print!("{} ({} Gflops/s)", nops[i], flops / 1_000_000_000);
@@ -503,7 +507,7 @@ where
     let iters = (mem_to_use - 2 * SIZE * SIZE * get_memory_size::<T>())
         / (SIZE * SIZE * get_memory_size::<T>());
     let (a_gpu, b_gpu, mut out_slices_gpu) = alloc_buffers(gpu.clone(), a, b, iters)?;
-    let handle = cublas::safe::CudaBlas::new(gpu)?;
+    let handle = CudaBlas::new(gpu)?;
     let mut i = 0;
     while !stop.load(std::sync::atomic::Ordering::Relaxed) {
         for out in out_slices_gpu.iter_mut() {
