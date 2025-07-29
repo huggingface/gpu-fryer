@@ -1,8 +1,7 @@
 use clap::Parser;
-use cudarc::cublaslt::result::{create_matmul_desc, create_matrix_layout, matmul, CublasError};
+use cudarc::cublaslt::result::{create_matmul_desc, create_matrix_layout, matmul};
 use cudarc::cublaslt::sys::cublasLtMatmulDescAttributes_t;
 use cudarc::cublaslt::sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES;
-use cudarc::cublaslt::sys::cublasStatus_t::CUBLAS_STATUS_EXECUTION_FAILED;
 use cudarc::cublaslt::sys::{cublasComputeType_t, cudaDataType};
 use cudarc::cublaslt::{result, CudaBlasLT, Matmul, MatmulConfig, MatmulShared};
 use cudarc::driver::result::mem_get_info;
@@ -17,7 +16,6 @@ use nvml_wrapper::Nvml;
 use rand::rngs::SmallRng;
 use rand::{RngCore, SeedableRng};
 use std::fmt::Debug;
-use std::mem;
 use std::sync::Arc;
 use tokio::signal;
 use tokio::sync::mpsc::{
