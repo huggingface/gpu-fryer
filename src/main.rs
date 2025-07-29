@@ -21,9 +21,10 @@ use tokio::signal;
 use tokio::sync::mpsc::{
     unbounded_channel, UnboundedReceiver as Receiver, UnboundedSender as Sender,
 };
+use tokio::task::JoinHandle;
 
 const SIZE: usize = 8192; // Ensure SIZE % 16 == 0 for Tensor Core optimization
-const MEM_TO_USE_PCT: f64 = 0.2; // Use 90% of GPU memory
+const MEM_TO_USE_PCT: f64 = 0.2; // Use 90% of GPU memory // FIXME: THIS IS NOT OK
 const MIN_DURATION_SECS: u64 = 10;
 
 const GPU_THROTTLING_REASON: &str =
@@ -58,6 +59,9 @@ struct Args {
     /// If the TFLOPS are within `tflops_tolerance`% of the best performing GPU, test will pass
     #[clap(long, default_value = "10")]
     tflops_tolerance: f64,
+    /// Use FP32 precision. If unset, will use FP32 if no GPUs support BF16 or FP8.
+    #[clap(long)]
+    use_fp32: bool,
     /// Use BF16 precision instead of FP32. GPU must support BF16 type. If unset, will use BF16 only if all GPUs support it.
     #[clap(long)]
     use_bf16: bool,
@@ -138,6 +142,7 @@ struct Config {
     tolerate_software_throttling: bool,
     use_bf16: bool,
     use_fp8: bool,
+    use_fp32: bool,
 }
 
 trait VariablePrecisionFloat:
@@ -181,6 +186,7 @@ async fn main() {
         nvml_lib_path: args.nvml_lib_path.clone(),
         tflops_tolerance: args.tflops_tolerance,
         tolerate_software_throttling: args.tolerate_software_throttling,
+        use_fp32: args.use_fp32,
         use_bf16: args.use_bf16,
         use_fp8: args.use_fp8,
     };
@@ -245,33 +251,87 @@ async fn run(config: Config) -> anyhow::Result<()> {
         config.use_bf16
     } else {
         // Auto-detect: use BF16 only if all GPUs support it
-        gpus.iter().all(|gpu| supports_bf16(gpu).unwrap_or(false)) && !use_fp8
+        gpus.iter().all(|gpu| supports_bf16(gpu).unwrap_or(false)) && !use_fp8 && !config.use_fp32
     };
 
+    let use_fp32 = config.use_fp32 || (!use_bf16 && !use_fp8);
+
     println!(
-        "Using {}",
-        if use_bf16 {
-            "BF16"
-        } else if use_fp8 {
-            "FP8"
-        } else {
-            "FP32"
-        }
+        "Using precision(s): {} {} {}",
+        if use_fp32 { "FP32" } else { "" },
+        if use_bf16 { "BF16" } else { "" },
+        if use_fp8 { "FP8" } else { "" }
     );
 
+    let (tx, rx) = unbounded_channel::<(usize, usize)>();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    tokio::spawn(shutdown_signal(stop.clone()));
+
+    // report progress
+    let stop_clone = stop.clone();
+    let gpus_healthy = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let gpus_healthy_clone = gpus_healthy.clone();
+    let nvml = Nvml::builder().lib_path(config.nvml_lib_path.as_ref()).init().expect("Unable to initialize NVML. Check if the NVIDIA driver is installed and the NVIDIA Management Library is available (libnvidia-ml.so).");
+    let config_clone = config.clone();
+    let mut handles = Vec::new();
+    let gpu_len = gpus.len();
+    let t = tokio::spawn(async move {
+        report_progress(
+            config_clone,
+            gpu_len,
+            nvml,
+            rx,
+            stop_clone,
+            gpus_healthy_clone,
+        )
+        .await;
+    });
+    handles.push(t);
+
     if use_bf16 {
-        run_with_precision::<half::bf16>(config, gpus).await
-    } else if use_fp8 {
-        run_with_precision::<F8E4M3>(config, gpus).await
+        handles.append(
+            &mut run_with_precision::<half::bf16>(gpus.clone(), tx.clone(), stop.clone()).await,
+        );
+    }
+    if use_fp8 {
+        handles.append(
+            &mut run_with_precision::<F8E4M3>(gpus.clone(), tx.clone(), stop.clone()).await,
+        );
+    }
+    if use_fp32 {
+        handles.append(&mut run_with_precision::<f32>(gpus, tx.clone(), stop.clone()).await);
+    }
+
+    // burn the GPU for given duration
+    let stop_cloned = stop.clone();
+    let wait = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        let mut tick = 0;
+        while !stop_cloned.load(std::sync::atomic::Ordering::Relaxed) && tick < config.duration_secs
+        {
+            interval.tick().await;
+            tick += 1;
+        }
+        stop_cloned.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
+    handles.push(wait);
+    // for handle in handles {
+    //     handle.await.expect("Thread panicked");
+    // }
+    // join all handles simultaneously
+    let _ = futures::future::join_all(handles).await;
+    if gpus_healthy.load(std::sync::atomic::Ordering::Relaxed) {
+        Ok(())
     } else {
-        run_with_precision::<f32>(config, gpus).await
+        Err(anyhow::anyhow!("Some GPUs are not healthy"))
     }
 }
 
 async fn run_with_precision<T: VariablePrecisionFloat + GpuCompute>(
-    config: Config,
     gpus: Vec<Arc<CudaContext>>,
-) -> anyhow::Result<()>
+    tx: Sender<(usize, usize)>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) -> Vec<JoinHandle<()>>
 where
     CudaBlasLT: Matmul<T>,
 {
@@ -288,9 +348,6 @@ where
     }
     println!("Matrices created");
 
-    let (tx, rx) = unbounded_channel::<(usize, usize)>();
-    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    tokio::spawn(shutdown_signal(stop.clone()));
     let mut handles = Vec::new();
     for gpu in gpus.clone() {
         let tx = tx.clone();
@@ -307,44 +364,7 @@ where
         });
         handles.push(t);
     }
-    // report progress
-    let stop_clone = stop.clone();
-    let gpus_healthy = Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let gpus_healthy_clone = gpus_healthy.clone();
-    let nvml = Nvml::builder().lib_path(config.nvml_lib_path.as_ref()).init().expect("Unable to initialize NVML. Check if the NVIDIA driver is installed and the NVIDIA Management Library is available (libnvidia-ml.so).");
-    let config_clone = config.clone();
-    let t = tokio::spawn(async move {
-        report_progress(
-            config_clone,
-            gpus.len(),
-            nvml,
-            rx,
-            stop_clone,
-            gpus_healthy_clone,
-        )
-        .await;
-    });
-    handles.push(t);
-    // burn the GPU for given duration
-    let wait = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-        let mut tick = 0;
-        while !stop.load(std::sync::atomic::Ordering::Relaxed) && tick < config.duration_secs {
-            interval.tick().await;
-            tick += 1;
-        }
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        drop(tx);
-    });
-    handles.push(wait);
-    for handle in handles {
-        handle.await.expect("Thread panicked");
-    }
-    if gpus_healthy.load(std::sync::atomic::Ordering::Relaxed) {
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!("Some GPUs are not healthy"))
-    }
+    handles
 }
 
 fn poll_temperatures(nvml: &Nvml, gpu_count: usize) -> anyhow::Result<Vec<usize>> {
@@ -593,7 +613,7 @@ impl GpuCompute for f32 {
     }
 }
 
-async unsafe fn burn_gpu<T: VariablePrecisionFloat>(
+async unsafe fn burn_gpu<T>(
     gpu_idx: usize,
     a: Vec<T>,
     b: Vec<T>,
@@ -602,7 +622,7 @@ async unsafe fn burn_gpu<T: VariablePrecisionFloat>(
 ) -> anyhow::Result<usize>
 where
     CudaBlasLT: Matmul<T>,
-    T: GpuCompute,
+    T: GpuCompute + VariablePrecisionFloat,
 {
     let gpu = CudaContext::new(gpu_idx)?;
     // compute the output matrix size
@@ -640,14 +660,14 @@ fn get_gpu_memory(gpu: Arc<CudaContext>) -> anyhow::Result<(usize, usize)> {
     Ok(mem_info)
 }
 
-fn alloc_buffers<T: VariablePrecisionFloat>(
+fn alloc_buffers<T>(
     gpu: Arc<CudaContext>,
     a: Vec<T>,
     b: Vec<T>,
     num_out_slices: usize,
 ) -> anyhow::Result<AllocBufferTuple<T>>
 where
-    T: GpuCompute,
+    T: GpuCompute + VariablePrecisionFloat,
 {
     let stream = gpu.default_stream();
     let a_gpu = stream.memcpy_stod(&a)?;
