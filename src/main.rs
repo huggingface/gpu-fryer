@@ -1,16 +1,23 @@
 use clap::Parser;
-use cudarc::cublas;
-use cudarc::cublas::sys::cublasOperation_t;
-use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
+use cudarc::cublaslt::result::{create_matmul_desc, create_matrix_layout, matmul, CublasError};
+use cudarc::cublaslt::sys::cublasLtMatmulDescAttributes_t;
+use cudarc::cublaslt::sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES;
+use cudarc::cublaslt::sys::cublasStatus_t::CUBLAS_STATUS_EXECUTION_FAILED;
+use cudarc::cublaslt::sys::{cublasComputeType_t, cudaDataType};
+use cudarc::cublaslt::{result, CudaBlasLT, Matmul, MatmulConfig, MatmulShared};
 use cudarc::driver::result::mem_get_info;
-use cudarc::driver::{sys, CudaDevice, CudaSlice, DeviceRepr, ValidAsZeroBits};
+use cudarc::driver::sys::CUdevice_attribute;
+use cudarc::driver::{
+    sys, CudaContext, CudaSlice, DevicePtr, DevicePtrMut, DeviceRepr, ValidAsZeroBits,
+};
+use float8::F8E4M3;
 use nvml_wrapper::bitmasks::device::ThrottleReasons;
 use nvml_wrapper::enum_wrappers::device::TemperatureSensor::Gpu;
 use nvml_wrapper::Nvml;
 use rand::rngs::SmallRng;
-use rand::RngCore;
-use rand::SeedableRng;
+use rand::{RngCore, SeedableRng};
 use std::fmt::Debug;
+use std::mem;
 use std::sync::Arc;
 use tokio::signal;
 use tokio::sync::mpsc::{
@@ -18,7 +25,7 @@ use tokio::sync::mpsc::{
 };
 
 const SIZE: usize = 8192; // Ensure SIZE % 16 == 0 for Tensor Core optimization
-const MEM_TO_USE_PCT: f64 = 0.9; // Use 90% of GPU memory
+const MEM_TO_USE_PCT: f64 = 0.2; // Use 90% of GPU memory
 const MIN_DURATION_SECS: u64 = 10;
 
 const GPU_THROTTLING_REASON: &str =
@@ -26,7 +33,16 @@ const GPU_THROTTLING_REASON: &str =
 const GPU_FLOPS_REASON: &str =
     "GPU is not performing as expected. Check the flops values and temperatures";
 
-type AllocBufferTuple<T> = (CudaSlice<T>, CudaSlice<T>, Vec<CudaSlice<T>>);
+#[cfg(target_arch = "x86_64")]
+const NVML_DEFAULT_LIB_PATH: &str = "/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1";
+#[cfg(target_arch = "aarch64")]
+const NVML_DEFAULT_LIB_PATH: &str = "/usr/lib/aarch64-linux-gnu/libnvidia-ml.so.1";
+
+type AllocBufferTuple<T> = (
+    CudaSlice<T>,
+    CudaSlice<T>,
+    Vec<CudaSlice<<T as GpuCompute>::Out>>,
+);
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
@@ -35,7 +51,7 @@ struct Args {
     #[clap(default_value = "60")]
     duration_secs: u64,
     /// Path to NVIDIA Management Library (libnvidia-ml.so)
-    #[clap(long, default_value = "/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1")]
+    #[clap(long, default_value = NVML_DEFAULT_LIB_PATH)]
     nvml_lib_path: String,
     /// Tolerate software throttling if the TFLOPS are in the acceptable range
     #[clap(long, default_value = "false")]
@@ -46,7 +62,10 @@ struct Args {
     tflops_tolerance: f64,
     /// Use BF16 precision instead of FP32. GPU must support BF16 type. If unset, will use BF16 only if all GPUs support it.
     #[clap(long)]
-    use_bf16: Option<bool>,
+    use_bf16: bool,
+    /// Use FP8 precision instead of FP32. GPU must support FP8 type. If unset, will use FP8 only if all GPUs support it.
+    #[clap(long)]
+    use_fp8: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -119,7 +138,8 @@ struct Config {
     nvml_lib_path: String,
     tflops_tolerance: f64,
     tolerate_software_throttling: bool,
-    use_bf16: Option<bool>,
+    use_bf16: bool,
+    use_fp8: bool,
 }
 
 trait VariablePrecisionFloat:
@@ -140,6 +160,12 @@ impl VariablePrecisionFloat for half::bf16 {
     }
 }
 
+impl VariablePrecisionFloat for F8E4M3 {
+    fn from_f32(f: f32) -> Self {
+        F8E4M3::from_f32(f)
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
@@ -152,15 +178,13 @@ async fn main() {
         std::process::exit(1);
     }
 
-    // detect architecture (x86_64 or aarch64) and set NVML library path accordingly
-
-
     let config = Config {
         duration_secs: args.duration_secs,
         nvml_lib_path: args.nvml_lib_path.clone(),
         tflops_tolerance: args.tflops_tolerance,
         tolerate_software_throttling: args.tolerate_software_throttling,
         use_bf16: args.use_bf16,
+        use_fp8: args.use_fp8,
     };
 
     match run(config).await {
@@ -199,45 +223,69 @@ async fn run(config: Config) -> anyhow::Result<()> {
             uuid_to_string(gpu.uuid()?)
         );
     }
+    let use_fp8 = if config.use_fp8 {
+        // If explicitly requested, check if all GPUs support it
+        let all_support_fp8 = gpus.iter().all(|gpu| supports_fp8(gpu).unwrap_or(false));
+        if !all_support_fp8 {
+            return Err(anyhow::anyhow!(
+                "FP8 was explicitly requested but not all GPUs support it. Remove the --use-fp8 flag"
+            ));
+        }
+        config.use_fp8
+    } else {
+        false
+    };
 
-    let use_bf16 = if let Some(requested_bf16) = config.use_bf16 {
+    let use_bf16 = if config.use_bf16 {
         // If explicitly requested, check if all GPUs support it
         let all_support_bf16 = gpus.iter().all(|gpu| supports_bf16(gpu).unwrap_or(false));
-        if requested_bf16 && !all_support_bf16 {
+        if config.use_bf16 && !all_support_bf16 {
             return Err(anyhow::anyhow!(
                 "BF16 was explicitly requested but not all GPUs support it. Remove the --use-bf16 flag"
             ));
         }
-        requested_bf16
+        config.use_bf16
     } else {
         // Auto-detect: use BF16 only if all GPUs support it
-        gpus.iter().all(|gpu| supports_bf16(gpu).unwrap_or(false))
+        gpus.iter().all(|gpu| supports_bf16(gpu).unwrap_or(false)) && !use_fp8
     };
 
-    println!("Using {}", if use_bf16 { "BF16" } else { "FP32" });
+    println!(
+        "Using {}",
+        if use_bf16 {
+            "BF16"
+        } else if use_fp8 {
+            "FP8"
+        } else {
+            "FP32"
+        }
+    );
 
     if use_bf16 {
         run_with_precision::<half::bf16>(config, gpus).await
+    } else if use_fp8 {
+        run_with_precision::<F8E4M3>(config, gpus).await
     } else {
         run_with_precision::<f32>(config, gpus).await
     }
 }
 
-async fn run_with_precision<T: VariablePrecisionFloat>(
+async fn run_with_precision<T: VariablePrecisionFloat + GpuCompute>(
     config: Config,
-    gpus: Vec<Arc<CudaDevice>>,
+    gpus: Vec<Arc<CudaContext>>,
 ) -> anyhow::Result<()>
 where
-    CudaBlas: Gemm<T>,
+    CudaBlasLT: Matmul<T>,
 {
     // create 2 matrix with random values
     println!("Creating random matrices");
     // use SmallRng to create random values, we don't need cryptographic security but we need speed
-    let mut small_rng = SmallRng::from_entropy();
+    let mut small_rng = SmallRng::from_rng(&mut rand::rng());
     let mut a = vec![T::from_f32(0.0); SIZE * SIZE];
     let mut b = vec![T::from_f32(0.0); SIZE * SIZE];
+    // fill matrices with random values and scale them to a small range so that they fit in the float8 range
     for i in 0..SIZE * SIZE {
-        a[i] = T::from_f32(small_rng.next_u32() as f32);
+        a[i] = T::from_f32(small_rng.next_u32() as f32 );
         b[i] = T::from_f32(small_rng.next_u32() as f32);
     }
     println!("Matrices created");
@@ -253,9 +301,11 @@ where
         let a = a.clone();
         let b = b.clone();
         let t = tokio::spawn(async move {
-            burn_gpu(gpu.ordinal(), a, b, tx, stop)
-                .await
-                .unwrap_or_else(|_| panic!("Unable to burn GPU #{}", gpu.ordinal()));
+            unsafe {
+                burn_gpu::<T>(gpu.ordinal(), a, b, tx, stop)
+                    .await
+                    .unwrap_or_else(|e| panic!("Unable to burn GPU #{}: {e}", gpu.ordinal()));
+            }
         });
         handles.push(t);
     }
@@ -317,10 +367,20 @@ fn poll_throttling(nvml: &Nvml, gpu_count: usize) -> anyhow::Result<Vec<Throttle
     Ok(throttling)
 }
 
-fn supports_bf16(gpu: &Arc<CudaDevice>) -> anyhow::Result<bool> {
+fn supports_bf16(gpu: &Arc<CudaContext>) -> anyhow::Result<bool> {
     Ok(
         gpu.attribute(sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)?
             >= 8
+            && gpu.attribute(
+                sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+            )? >= 0,
+    )
+}
+
+fn supports_fp8(gpu: &Arc<CudaContext>) -> anyhow::Result<bool> {
+    Ok(
+        gpu.attribute(sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)?
+            >= 9
             && gpu.attribute(
                 sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
             )? >= 0,
@@ -487,7 +547,55 @@ fn are_gpus_healthy(
     (reasons.is_empty(), reasons)
 }
 
-async fn burn_gpu<T: VariablePrecisionFloat>(
+trait GpuCompute: VariablePrecisionFloat {
+    type Out: DeviceRepr + ValidAsZeroBits + 'static;
+    unsafe fn compute(
+        handle: &CudaBlasLT,
+        a: &CudaSlice<Self>,
+        b: &CudaSlice<Self>,
+        out: &mut CudaSlice<Self::Out>,
+    ) -> anyhow::Result<()>
+    where
+        Self: Sized + VariablePrecisionFloat;
+}
+
+impl GpuCompute for F8E4M3 {
+    type Out = half::bf16;
+    unsafe fn compute(
+        handle: &CudaBlasLT,
+        a: &CudaSlice<F8E4M3>,
+        b: &CudaSlice<F8E4M3>,
+        out: &mut CudaSlice<half::bf16>,
+    ) -> anyhow::Result<()> {
+        compute_fp8(handle, a, b, out)
+    }
+}
+
+impl GpuCompute for half::bf16 {
+    type Out = half::bf16;
+    unsafe fn compute(
+        handle: &CudaBlasLT,
+        a: &CudaSlice<half::bf16>,
+        b: &CudaSlice<half::bf16>,
+        out: &mut CudaSlice<half::bf16>,
+    ) -> anyhow::Result<()> {
+        compute(handle, a, b, out)
+    }
+}
+
+impl GpuCompute for f32 {
+    type Out = f32;
+    unsafe fn compute(
+        handle: &CudaBlasLT,
+        a: &CudaSlice<f32>,
+        b: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+    ) -> anyhow::Result<()> {
+        compute(handle, a, b, out)
+    }
+}
+
+async unsafe fn burn_gpu<T: VariablePrecisionFloat>(
     gpu_idx: usize,
     a: Vec<T>,
     b: Vec<T>,
@@ -495,9 +603,10 @@ async fn burn_gpu<T: VariablePrecisionFloat>(
     stop: Arc<std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<usize>
 where
-    CudaBlas: Gemm<T>,
+    CudaBlasLT: Matmul<T>,
+    T: GpuCompute,
 {
-    let gpu = CudaDevice::new(gpu_idx)?;
+    let gpu = CudaContext::new(gpu_idx)?;
     // compute the output matrix size
     let (free_mem, _) = get_gpu_memory(gpu.clone())?;
     let mem_to_use = (free_mem as f64 * MEM_TO_USE_PCT) as usize;
@@ -509,12 +618,12 @@ where
     );
     let iters = (mem_to_use - 2 * SIZE * SIZE * get_memory_size::<T>())
         / (SIZE * SIZE * get_memory_size::<T>());
-    let (a_gpu, b_gpu, mut out_slices_gpu) = alloc_buffers(gpu.clone(), a, b, iters)?;
-    let handle = CudaBlas::new(gpu)?;
+    let (a_gpu, b_gpu, mut out_slices_gpu) = alloc_buffers::<T>(gpu.clone(), a, b, iters)?;
+    let handle = CudaBlasLT::new(gpu.default_stream())?;
     let mut i = 0;
     while !stop.load(std::sync::atomic::Ordering::Relaxed) {
         for out in out_slices_gpu.iter_mut() {
-            compute(&handle, &a_gpu, &b_gpu, out)?;
+            T::compute(&handle, &a_gpu, &b_gpu, out)?;
             i += 1;
             _ = tx.send((gpu_idx, 1));
         }
@@ -527,60 +636,165 @@ fn get_memory_size<T>() -> usize {
     size_of::<T>()
 }
 
-fn get_gpu_memory(gpu: Arc<CudaDevice>) -> anyhow::Result<(usize, usize)> {
-    CudaDevice::new(gpu.ordinal())?;
+fn get_gpu_memory(gpu: Arc<CudaContext>) -> anyhow::Result<(usize, usize)> {
+    CudaContext::new(gpu.ordinal())?;
     let mem_info = mem_get_info()?;
     Ok(mem_info)
 }
 
 fn alloc_buffers<T: VariablePrecisionFloat>(
-    gpu: Arc<CudaDevice>,
+    gpu: Arc<CudaContext>,
     a: Vec<T>,
     b: Vec<T>,
     num_out_slices: usize,
-) -> anyhow::Result<AllocBufferTuple<T>> {
-    let a_gpu = gpu.htod_copy(a)?;
-    let b_gpu = gpu.htod_copy(b)?;
+) -> anyhow::Result<AllocBufferTuple<T>>
+where
+    T: GpuCompute,
+{
+    let stream = gpu.default_stream();
+    let a_gpu = stream.memcpy_stod(&a)?;
+    let b_gpu = stream.memcpy_stod(&b)?;
     let mut out_slices = vec![];
     for _ in 0..num_out_slices {
-        let out = gpu.alloc_zeros::<T>(SIZE * SIZE)?;
+        let out = stream.alloc_zeros::<T::Out>(SIZE * SIZE)?;
         out_slices.push(out);
     }
     Ok((a_gpu, b_gpu, out_slices))
 }
 
+/// Matrix multiplication for FP8 using CUBLAS LT as it is not supported in the standard CUBLAS API.
+/// We use F8E4M3 as the input type and produce half::bf16 as the output type.
+/// The function uses cudarc low-level bindings as it does not support Matmul with heterogeneous types (F8E4M3 matmul with bf16 output).
+unsafe fn compute_fp8(
+    handle: &CudaBlasLT,
+    a: &CudaSlice<F8E4M3>,
+    b: &CudaSlice<F8E4M3>,
+    out: &mut CudaSlice<half::bf16>,
+) -> anyhow::Result<()> {
+    let stream = handle.stream().clone();
+    let major = stream
+        .context()
+        .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)?;
+    let workspace_size = if major >= 9 { 33_554_432 } else { 4_194_304 }; // FIXME: that should be exposed in cudarc API
+    let mut buffer = stream
+        .alloc_zeros::<u8>(workspace_size)
+        .map_err(|e| CublasError {
+            0: CUBLAS_STATUS_EXECUTION_FAILED,
+        })?;
+
+    let desc = create_matmul_desc(
+        cublasComputeType_t::CUBLAS_COMPUTE_32F, // compute type
+        cudaDataType::CUDA_R_32F,                // scale type
+    )?;
+    result::set_matmul_desc_attribute(
+        desc,
+        cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
+        (&1) as *const _ as *const _,
+        mem::size_of::<u32>(),
+    )?;
+    let layout_a = create_matrix_layout(
+        cudaDataType::CUDA_R_8F_E4M3, // data type for A
+        SIZE as u64,                  // rows
+        SIZE as u64,                  // cols
+        SIZE as i64,                  // leading dimension
+    )?;
+    let layout_b = create_matrix_layout(
+        cudaDataType::CUDA_R_8F_E4M3, // data type for B
+        SIZE as u64,                  // rows
+        SIZE as u64,                  // cols
+        SIZE as i64,                  // leading dimension
+    )?;
+    let layout_c = create_matrix_layout(
+        cudaDataType::CUDA_R_16F, // data type for C
+        SIZE as u64,              // rows
+        SIZE as u64,              // cols
+        SIZE as i64,              // leading dimension
+    )?;
+    let alpha = 1.0f32;
+    let beta = 0.0f32;
+
+    // get the heuristic for the best algorithm
+    let matmul_pref_handle = result::create_matmul_pref()?;
+    result::set_matmul_pref_attribute(
+        matmul_pref_handle,
+        CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+        (&buffer) as *const _ as *const _,
+        size_of::<usize>(),
+    )?;
+    let heuristic = result::get_matmul_algo_heuristic(
+        *handle.handle(),
+        desc,
+        layout_a,
+        layout_b,
+        layout_c,
+        layout_c,
+        matmul_pref_handle,
+    )?;
+
+    // run matmul kernel
+    let (a, _) = a.device_ptr(&handle.stream());
+    let (b, _) = b.device_ptr(&handle.stream());
+    let (out, _) = out.device_ptr_mut(&handle.stream());
+    let (w, _) = buffer.device_ptr_mut(&handle.stream());
+    matmul(
+        *handle.handle(),
+        desc,
+        &alpha as *const _ as *const _, // alpha
+        &beta as *const _ as *const _,  // beta
+        a as *const _,
+        layout_a,
+        b as *const _,
+        layout_b,
+        out as *const _,
+        layout_c,
+        out as *mut _,
+        layout_c,
+        (&heuristic.algo) as *const _,
+        w as *mut _, // workspace
+        workspace_size,
+        handle.stream().cu_stream() as *mut _,
+    )?;
+    Ok(())
+}
+
 fn compute<T: VariablePrecisionFloat>(
-    handle: &cublas::safe::CudaBlas,
+    handle: &CudaBlasLT,
     a: &CudaSlice<T>,
     b: &CudaSlice<T>,
     out: &mut CudaSlice<T>,
 ) -> anyhow::Result<()>
 where
-    CudaBlas: Gemm<T>,
+    CudaBlasLT: Matmul<T>,
 {
-    let cfg = GemmConfig {
-        transa: cublasOperation_t::CUBLAS_OP_N,
-        transb: cublasOperation_t::CUBLAS_OP_N,
-        m: SIZE as i32,
-        n: SIZE as i32,
-        k: SIZE as i32,
-        alpha: T::from_f32(1.0),
-        lda: SIZE as i32,
-        ldb: SIZE as i32,
-        beta: T::from_f32(0.0),
-        ldc: SIZE as i32,
+    let cfg = MatmulConfig {
+        transa: false,
+        transb: false,
+        transc: false,
+        m: SIZE as u64,
+        n: SIZE as u64,
+        k: SIZE as u64,
+        alpha: 1.0,
+        lda: SIZE as i64,
+        ldb: SIZE as i64,
+        beta: 0.0,
+        ldc: SIZE as i64,
+        stride_a: None,
+        stride_b: None,
+        stride_c: None,
+        stride_bias: None,
+        batch_size: None,
     };
     unsafe {
-        handle.gemm(cfg, a, b, out)?;
+        handle.matmul(cfg, a, b, out, None, None)?;
     }
     Ok(())
 }
 
-fn detect_gpus() -> anyhow::Result<Vec<Arc<CudaDevice>>> {
-    let num_gpus = CudaDevice::count()? as usize;
+fn detect_gpus() -> anyhow::Result<Vec<Arc<CudaContext>>> {
+    let num_gpus = CudaContext::device_count()? as usize;
     let mut devices = Vec::new();
     for i in 0..num_gpus {
-        let dev = CudaDevice::new(i)?;
+        let dev = CudaContext::new(i)?;
         devices.push(dev);
     }
     Ok(devices)
