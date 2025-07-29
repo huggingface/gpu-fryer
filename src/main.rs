@@ -170,7 +170,7 @@ impl VariablePrecisionFloat for F8E4M3 {
 async fn main() {
     let args = Args::parse();
     if args.duration_secs < MIN_DURATION_SECS {
-        eprintln!("Duration must be at least {} seconds", MIN_DURATION_SECS);
+        eprintln!("Duration must be at least {MIN_DURATION_SECS} seconds");
         std::process::exit(1);
     }
     if args.tflops_tolerance < 0.0 || args.tflops_tolerance > 100.0 {
@@ -190,7 +190,7 @@ async fn main() {
     match run(config).await {
         Ok(_) => {}
         Err(e) => {
-            eprintln!("Error: {}", e);
+            eprintln!("Error: {e}");
             std::process::exit(1);
         }
     };
@@ -285,7 +285,7 @@ where
     let mut b = vec![T::from_f32(0.0); SIZE * SIZE];
     // fill matrices with random values and scale them to a small range so that they fit in the float8 range
     for i in 0..SIZE * SIZE {
-        a[i] = T::from_f32(small_rng.next_u32() as f32 );
+        a[i] = T::from_f32(small_rng.next_u32() as f32);
         b[i] = T::from_f32(small_rng.next_u32() as f32);
     }
     println!("Matrices created");
@@ -507,7 +507,7 @@ async fn report_progress(
     } else {
         println!("Some GPUs are not healthy. Reasons:");
         for r in reasons {
-            println!("  - {}", r);
+            println!("  - {r}");
         }
     }
     gpus_healthy.store(healthy, std::sync::atomic::Ordering::Relaxed);
@@ -619,7 +619,7 @@ where
     let iters = (mem_to_use - 2 * SIZE * SIZE * get_memory_size::<T>())
         / (SIZE * SIZE * get_memory_size::<T>());
     let (a_gpu, b_gpu, mut out_slices_gpu) = alloc_buffers::<T>(gpu.clone(), a, b, iters)?;
-    let handle = CudaBlasLT::new(gpu.default_stream())?;
+    let handle = CudaBlasLT::new(gpu.new_stream()?)?;
     let mut i = 0;
     while !stop.load(std::sync::atomic::Ordering::Relaxed) {
         for out in out_slices_gpu.iter_mut() {
@@ -676,11 +676,7 @@ unsafe fn compute_fp8(
         .context()
         .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)?;
     let workspace_size = if major >= 9 { 33_554_432 } else { 4_194_304 }; // FIXME: that should be exposed in cudarc API
-    let mut buffer = stream
-        .alloc_zeros::<u8>(workspace_size)
-        .map_err(|e| CublasError {
-            0: CUBLAS_STATUS_EXECUTION_FAILED,
-        })?;
+    let mut buffer = stream.alloc_zeros::<u8>(workspace_size)?;
 
     let desc = create_matmul_desc(
         cublasComputeType_t::CUBLAS_COMPUTE_32F, // compute type
@@ -690,7 +686,7 @@ unsafe fn compute_fp8(
         desc,
         cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
         (&1) as *const _ as *const _,
-        mem::size_of::<u32>(),
+        size_of::<u32>(),
     )?;
     let layout_a = create_matrix_layout(
         cudaDataType::CUDA_R_8F_E4M3, // data type for A
@@ -732,10 +728,10 @@ unsafe fn compute_fp8(
     )?;
 
     // run matmul kernel
-    let (a, _) = a.device_ptr(&handle.stream());
-    let (b, _) = b.device_ptr(&handle.stream());
-    let (out, _) = out.device_ptr_mut(&handle.stream());
-    let (w, _) = buffer.device_ptr_mut(&handle.stream());
+    let (a, _) = a.device_ptr(handle.stream());
+    let (b, _) = b.device_ptr(handle.stream());
+    let (out, _) = out.device_ptr_mut(handle.stream());
+    let (w, _) = buffer.device_ptr_mut(handle.stream());
     matmul(
         *handle.handle(),
         desc,
