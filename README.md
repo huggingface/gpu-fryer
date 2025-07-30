@@ -64,8 +64,9 @@ There is currently no absolute performance metric. For reference:
 
 | GPU                   | TFLOPS | Precision |
 |-----------------------|--------|-----------|
-| NVIDIA H100 80GB HBM3 | ~51    | FP32      |
-| NVIDIA H100 80GB HBM3 | ~676   | BF16      |
+| NVIDIA H100 80GB HBM3 | ~373   | FP32      |
+| NVIDIA H100 80GB HBM3 | ~730   | BF16      |
+| NVIDIA H100 80GB HBM3 | ~1530  | FP8       |
 | NVIDIA GH200 480GB    | ~363   | FP32      |
 | NVIDIA GH200 480GB    | ~705   | BF16      |
 | NVIDIA GH200 480GB    | ~1660  | FP8       |
