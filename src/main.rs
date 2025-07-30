@@ -1,13 +1,13 @@
 use clap::Parser;
 use cudarc::cublaslt::result::{create_matmul_desc, create_matrix_layout, matmul};
-use cudarc::cublaslt::sys::cublasLtMatmulDescAttributes_t;
 use cudarc::cublaslt::sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES;
-use cudarc::cublaslt::sys::{cublasComputeType_t, cudaDataType};
+use cudarc::cublaslt::sys::{cublasComputeType_t, cublasStatus_t, cudaDataType};
+use cudarc::cublaslt::sys::{cublasLtMatmulDescAttributes_t, cublasLtMatmulHeuristicResult_t};
 use cudarc::cublaslt::{result, CudaBlasLT, Matmul, MatmulConfig, MatmulShared};
 use cudarc::driver::result::mem_get_info;
 use cudarc::driver::sys::CUdevice_attribute;
 use cudarc::driver::{
-    sys, CudaContext, CudaSlice, DevicePtr, DevicePtrMut, DeviceRepr, ValidAsZeroBits,
+    sys, CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, DeviceRepr, ValidAsZeroBits,
 };
 use float8::F8E4M3;
 use nvml_wrapper::bitmasks::device::ThrottleReasons;
@@ -16,6 +16,7 @@ use nvml_wrapper::Nvml;
 use rand::rngs::SmallRng;
 use rand::{RngCore, SeedableRng};
 use std::fmt::Debug;
+use std::mem::MaybeUninit;
 use std::sync::Arc;
 use tokio::signal;
 use tokio::sync::mpsc::{
@@ -24,7 +25,7 @@ use tokio::sync::mpsc::{
 use tokio::task::JoinHandle;
 
 const SIZE: usize = 8192; // Ensure SIZE % 16 == 0 for Tensor Core optimization
-const MEM_TO_USE_PCT: f64 = 0.2; // Use 90% of GPU memory // FIXME: THIS IS NOT OK
+const MEM_TO_USE_PCT: f64 = 0.3; // Use 90% of GPU memory // FIXME: THIS IS NOT OK
 const MIN_DURATION_SECS: u64 = 10;
 
 const GPU_THROTTLING_REASON: &str =
@@ -609,7 +610,7 @@ impl GpuCompute for f32 {
         b: &CudaSlice<f32>,
         out: &mut CudaSlice<f32>,
     ) -> anyhow::Result<()> {
-        compute(handle, a, b, out)
+        compute_fp32(handle, a, b, out)
     }
 }
 
@@ -634,17 +635,43 @@ where
         mem_to_use / 1024 / 1024,
         free_mem / 1024 / 1024
     );
-    let iters = (mem_to_use - 2 * SIZE * SIZE * get_memory_size::<T>())
-        / (SIZE * SIZE * get_memory_size::<T>());
+    let iters = (mem_to_use - 2 * SIZE * SIZE * get_memory_size::<T::Out>())
+        / (SIZE * SIZE * get_memory_size::<T::Out>());
     let (a_gpu, b_gpu, mut out_slices_gpu) = alloc_buffers::<T>(gpu.clone(), a, b, iters)?;
+    let num_streams = 4;
+    let handles: Vec<Arc<CudaBlasLT>> = (0..num_streams)
+        .map(|_| {
+            Arc::new(CudaBlasLT::new(gpu.new_stream().expect("stream creation failed")).unwrap())
+        })
+        .collect();
     let handle = CudaBlasLT::new(gpu.new_stream()?)?;
     let mut i = 0;
+    // check if we have at least num_streams output slices
+    if out_slices_gpu.len() < num_streams {
+        return Err(anyhow::anyhow!(
+            "Not enough output slices allocated. Expected at least {}, got {}",
+            num_streams,
+            out_slices_gpu.len()
+        ));
+    }
     while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-        for out in out_slices_gpu.iter_mut() {
-            T::compute(&handle, &a_gpu, &b_gpu, out)?;
-            i += 1;
-            _ = tx.send((gpu_idx, 1));
+        let mut join_handles = vec![];
+        for j in 0..num_streams {
+            let mut out = out_slices_gpu[i % out_slices_gpu.len()].clone();
+            let a_gpu_clone = a_gpu.clone();
+            let b_gpu_clone = b_gpu.clone();
+            let handle_clone = handles[j % handles.len()].clone();
+            let tx_clone = tx.clone();
+            join_handles.push(tokio::spawn(async move {
+                unsafe {
+                    T::compute(&handle_clone, &a_gpu_clone, &b_gpu_clone, &mut out)
+                        .expect("Computation failed");
+                    _ = tx_clone.send((gpu_idx, 1));
+                }
+            }));
         }
+        futures::future::join_all(join_handles).await;
+        i += num_streams;
     }
     drop(tx);
     Ok(i)
@@ -764,6 +791,117 @@ unsafe fn compute_fp8(
         out as *mut _,
         layout_c,
         (&heuristic.algo) as *const _,
+        w as *mut _, // workspace
+        workspace_size,
+        handle.stream().cu_stream() as *mut _,
+    )?;
+    Ok(())
+}
+
+unsafe fn compute_fp32(
+    handle: &CudaBlasLT,
+    a: &CudaSlice<f32>,
+    b: &CudaSlice<f32>,
+    out: &mut CudaSlice<f32>,
+) -> anyhow::Result<()> {
+    let stream = handle.stream().clone();
+    let major = stream
+        .context()
+        .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)?;
+    let workspace_size = if major >= 9 { 33_554_432 } else { 4_194_304 }; // FIXME: that should be exposed in cudarc API
+    let mut buffer = stream.alloc_zeros::<u8>(workspace_size)?;
+
+    let desc = create_matmul_desc(
+        cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32, // compute type
+        cudaDataType::CUDA_R_32F,                          // scale type
+    )?;
+    result::set_matmul_desc_attribute(
+        desc,
+        cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
+        (&1) as *const _ as *const _,
+        size_of::<u32>(),
+    )?;
+    let layout_a = create_matrix_layout(
+        cudaDataType::CUDA_R_32F, // data type for A
+        SIZE as u64,              // rows
+        SIZE as u64,              // cols
+        SIZE as i64,              // leading dimension
+    )?;
+    let layout_b = create_matrix_layout(
+        cudaDataType::CUDA_R_32F, // data type for B
+        SIZE as u64,              // rows
+        SIZE as u64,              // cols
+        SIZE as i64,              // leading dimension
+    )?;
+    let layout_c = create_matrix_layout(
+        cudaDataType::CUDA_R_32F, // data type for C
+        SIZE as u64,              // rows
+        SIZE as u64,              // cols
+        SIZE as i64,              // leading dimension
+    )?;
+    let alpha = 1.0f32;
+    let beta = 0.0f32;
+
+    // get the heuristic for the best algorithm
+    let matmul_pref_handle = result::create_matmul_pref()?;
+    result::set_matmul_pref_attribute(
+        matmul_pref_handle,
+        CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+        (&buffer) as *const _ as *const _,
+        size_of::<usize>(),
+    )?;
+
+    const NUM_ALGOS: usize = 10;
+    let mut algo_count = 0;
+    let mut matmul_heuristic: [MaybeUninit<cublasLtMatmulHeuristicResult_t>; NUM_ALGOS] =
+        MaybeUninit::uninit().assume_init();
+    let status = cudarc::cublaslt::sys::cublasLtMatmulAlgoGetHeuristic(
+        *handle.handle(),
+        desc,
+        layout_a,
+        layout_b,
+        layout_c,
+        layout_c,
+        matmul_pref_handle,
+        10,
+        matmul_heuristic.as_mut_ptr() as *mut cublasLtMatmulHeuristicResult_t,
+        &mut algo_count,
+    );
+    if status != cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+        return Err(anyhow::anyhow!(
+            "cublasLtMatmulAlgoGetHeuristic failed: {:?}",
+            status
+        ));
+    }
+    let matmul_heuristic: Vec<cublasLtMatmulHeuristicResult_t> = matmul_heuristic
+        [..(algo_count as usize)]
+        .iter()
+        .map(|x| unsafe { x.assume_init() })
+        .collect();
+
+    if matmul_heuristic.is_empty() {
+        return Err(anyhow::anyhow!("No matmul heuristic found"));
+    }
+
+    // run matmul kernel
+    let (a, _) = a.device_ptr(handle.stream());
+    let (b, _) = b.device_ptr(handle.stream());
+    let (out, _) = out.device_ptr_mut(handle.stream());
+    let (w, _) = buffer.device_ptr_mut(handle.stream());
+    matmul(
+        *handle.handle(),
+        desc,
+        &alpha as *const _ as *const _, // alpha
+        &beta as *const _ as *const _,  // beta
+        a as *const _,
+        layout_a,
+        b as *const _,
+        layout_b,
+        out as *const _,
+        layout_c,
+        out as *mut _,
+        layout_c,
+        (&matmul_heuristic.last().expect("no heuristic algo found").algo) as *const _,
         w as *mut _, // workspace
         workspace_size,
         handle.stream().cu_stream() as *mut _,
