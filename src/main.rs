@@ -658,8 +658,8 @@ where
     let gpu = CudaContext::new(gpu_idx)?;
     // compute the output matrix size
     println!("GPU #{gpu_idx}: Using {mem_to_use_mb} MB");
-    let iters = (mem_to_use_mb * 1024 * 1024 - 2 * SIZE * SIZE * get_memory_size::<T>())
-        / (SIZE * SIZE * get_memory_size::<T>());
+    let iters = (mem_to_use_mb * 1024 * 1024 - 2 * SIZE * SIZE * get_memory_size::<T::Out>())
+        / (SIZE * SIZE * get_memory_size::<T::Out>());
     let (a_gpu, b_gpu, mut out_slices_gpu) = alloc_buffers::<T>(gpu.clone(), a, b, iters)?;
     let handle = CudaBlasLT::new(gpu.new_stream()?)?;
     let mut i = 0;
