@@ -15,6 +15,7 @@ use nvml_wrapper::enum_wrappers::device::TemperatureSensor::Gpu;
 use nvml_wrapper::Nvml;
 use rand::rngs::SmallRng;
 use rand::{RngCore, SeedableRng};
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 use tokio::signal;
@@ -24,7 +25,7 @@ use tokio::sync::mpsc::{
 use tokio::task::JoinHandle;
 
 const SIZE: usize = 8192; // Ensure SIZE % 16 == 0 for Tensor Core optimization
-const MEM_TO_USE_PCT: f64 = 0.2; // Use 90% of GPU memory // FIXME: THIS IS NOT OK
+const MEM_TO_USE_PCT: usize = 90; // Use 90% of GPU memory
 const MIN_DURATION_SECS: u64 = 10;
 
 const GPU_THROTTLING_REASON: &str =
@@ -62,10 +63,10 @@ struct Args {
     /// Use FP32 precision. If unset, will use FP32 if no GPUs support BF16 or FP8.
     #[clap(long)]
     use_fp32: bool,
-    /// Use BF16 precision instead of FP32. GPU must support BF16 type. If unset, will use BF16 only if all GPUs support it.
+    /// Use BF16 precision. GPU must support BF16 type. If unset, will use BF16 only if all GPUs support it.
     #[clap(long)]
     use_bf16: bool,
-    /// Use FP8 precision instead of FP32. GPU must support FP8 type. If unset, will use FP8 only if all GPUs support it.
+    /// Use FP8 precision. GPU must support FP8 type.
     #[clap(long)]
     use_fp8: bool,
 }
@@ -288,18 +289,45 @@ async fn run(config: Config) -> anyhow::Result<()> {
     });
     handles.push(t);
 
+    // compute the memory to use for each GPU, depending on the number of precisions we compute simultaneously
+    let num_precisions = usize::from(use_fp32) + usize::from(use_bf16) + usize::from(use_fp8);
+    let mem_to_use_pct = MEM_TO_USE_PCT / num_precisions;
+    let mem_to_use_mb = gpus
+        .iter()
+        .map(|gpu| {
+            let (free_mem, _) = get_gpu_memory(gpu.clone())?;
+            Ok((gpu.ordinal(), free_mem / 1024 / 1024 * mem_to_use_pct / 100))
+        })
+        .collect::<Result<HashMap<usize, usize>, anyhow::Error>>()?;
+    let mem_to_use = Arc::new(mem_to_use_mb);
+
     if use_bf16 {
         handles.append(
-            &mut run_with_precision::<half::bf16>(gpus.clone(), tx.clone(), stop.clone()).await,
+            &mut run_with_precision::<half::bf16>(
+                gpus.clone(),
+                mem_to_use.clone(),
+                tx.clone(),
+                stop.clone(),
+            )
+            .await,
         );
     }
     if use_fp8 {
         handles.append(
-            &mut run_with_precision::<F8E4M3>(gpus.clone(), tx.clone(), stop.clone()).await,
+            &mut run_with_precision::<F8E4M3>(
+                gpus.clone(),
+                mem_to_use.clone(),
+                tx.clone(),
+                stop.clone(),
+            )
+            .await,
         );
     }
     if use_fp32 {
-        handles.append(&mut run_with_precision::<f32>(gpus, tx.clone(), stop.clone()).await);
+        handles.append(
+            &mut run_with_precision::<f32>(gpus, mem_to_use.clone(), tx.clone(), stop.clone())
+                .await,
+        );
     }
 
     // burn the GPU for given duration
@@ -329,6 +357,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
 
 async fn run_with_precision<T: VariablePrecisionFloat + GpuCompute>(
     gpus: Vec<Arc<CudaContext>>,
+    mem_to_use_mb: Arc<HashMap<usize, usize>>,
     tx: Sender<(usize, usize)>,
     stop: Arc<std::sync::atomic::AtomicBool>,
 ) -> Vec<JoinHandle<()>>
@@ -355,9 +384,10 @@ where
         let gpu = gpu.clone();
         let a = a.clone();
         let b = b.clone();
+        let mem = mem_to_use_mb[&gpu.ordinal()].clone();
         let t = tokio::spawn(async move {
             unsafe {
-                burn_gpu::<T>(gpu.ordinal(), a, b, tx, stop)
+                burn_gpu::<T>(gpu.ordinal(), mem, a, b, tx, stop)
                     .await
                     .unwrap_or_else(|e| panic!("Unable to burn GPU #{}: {e}", gpu.ordinal()));
             }
@@ -615,6 +645,7 @@ impl GpuCompute for f32 {
 
 async unsafe fn burn_gpu<T>(
     gpu_idx: usize,
+    mem_to_use_mb: usize,
     a: Vec<T>,
     b: Vec<T>,
     tx: Sender<(usize, usize)>,
@@ -626,15 +657,8 @@ where
 {
     let gpu = CudaContext::new(gpu_idx)?;
     // compute the output matrix size
-    let (free_mem, _) = get_gpu_memory(gpu.clone())?;
-    let mem_to_use = (free_mem as f64 * MEM_TO_USE_PCT) as usize;
-    println!(
-        "GPU #{}: Using {} MB out of {} MB",
-        gpu_idx,
-        mem_to_use / 1024 / 1024,
-        free_mem / 1024 / 1024
-    );
-    let iters = (mem_to_use - 2 * SIZE * SIZE * get_memory_size::<T>())
+    println!("GPU #{gpu_idx}: Using {mem_to_use_mb} MB");
+    let iters = (mem_to_use_mb * 1024 * 1024 - 2 * SIZE * SIZE * get_memory_size::<T>())
         / (SIZE * SIZE * get_memory_size::<T>());
     let (a_gpu, b_gpu, mut out_slices_gpu) = alloc_buffers::<T>(gpu.clone(), a, b, iters)?;
     let handle = CudaBlasLT::new(gpu.new_stream()?)?;
@@ -693,7 +717,7 @@ unsafe fn compute_fp8(
     let major = stream
         .context()
         .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)?;
-    let workspace_size = if major >= 9 { 33_554_432 } else { 4_194_304 }; // FIXME: that should be exposed in cudarc API
+    let workspace_size = if major >= 9 { 33_554_432 } else { 4_194_304 }; // that should be exposed in cudarc API, but for now everything is private
     let mut buffer = stream.alloc_zeros::<u8>(workspace_size)?;
 
     let desc = create_matmul_desc(
