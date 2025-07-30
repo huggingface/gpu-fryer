@@ -384,7 +384,7 @@ where
         let gpu = gpu.clone();
         let a = a.clone();
         let b = b.clone();
-        let mem = mem_to_use_mb[&gpu.ordinal()].clone();
+        let mem = mem_to_use_mb[&gpu.ordinal()];
         let t = tokio::spawn(async move {
             unsafe {
                 burn_gpu::<T>(gpu.ordinal(), mem, a, b, tx, stop)

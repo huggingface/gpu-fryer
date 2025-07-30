@@ -13,6 +13,7 @@ We use it at [Hugging Face](https://huggingface.co) 🤗 to monitor our HPC clus
 Use Docker:
 
 ```bash
+# You need a system with NVIDIA GPUs and driver ≥ 575.57.08
 docker run --gpus all ghcr.io/huggingface/gpu-fryer:1.0.0 60
 ```
 
