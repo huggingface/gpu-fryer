@@ -14,7 +14,7 @@ Use Docker:
 
 ```bash
 # You need a system with NVIDIA GPUs and driver ≥ 575.57.08
-docker run --gpus all ghcr.io/huggingface/gpu-fryer:1.0.0 60
+docker run --gpus all ghcr.io/huggingface/gpu-fryer:1.1.0 60
 ```
 
 ## Usage
