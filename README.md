@@ -66,6 +66,7 @@ There is currently no absolute performance metric. For reference:
 |-----------------------------|----------------|----------------|----------------|
 | NVIDIA V100-SXM2-16GB HBM2  | ~14            | n/a            | n/a            |
 | NVIDIA V100-SXM2-32GB HBM2  | ~14            | n/a            | n/a            |
+| NVIDIA A100-PCIE-40GB HBM2  | ~106           | ~224           | n/a            |
 | NVIDIA A100-SXM4-80GB HBM2e | ~130           | ~270           | n/a            |
 | NVIDIA H100-SXM5-80GB HBM3  | ~373           | ~730           | ~1530          |
 | NVIDIA GH200 480GB HBM3e    | ~363           | ~705           | ~1660          |
