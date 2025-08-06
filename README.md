@@ -62,14 +62,16 @@ GPU fryer checks for homogeneous performance across all GPUs in the system (if m
 any performance degradation or thermal throttling.
 There is currently no absolute performance metric. For reference:
 
-| GPU                   | TFLOPS | Precision |
-|-----------------------|--------|-----------|
-| NVIDIA H100 80GB HBM3 | ~373   | FP32      |
-| NVIDIA H100 80GB HBM3 | ~730   | BF16      |
-| NVIDIA H100 80GB HBM3 | ~1530  | FP8       |
-| NVIDIA GH200 480GB    | ~363   | FP32      |
-| NVIDIA GH200 480GB    | ~705   | BF16      |
-| NVIDIA GH200 480GB    | ~1660  | FP8       |
+| GPU                         | FP32 (TFLOPS)  | BF16 (TFLOPS)  | FP8 (TFLOPS)   |
+|-----------------------------|----------------|----------------|----------------|
+| NVIDIA V100-SXM2-16GB HBM2  | ~14            | n/a            | n/a            |
+| NVIDIA V100-SXM2-32GB HBM2  | ~14            | n/a            | n/a            |
+| NVIDIA A100-PCIE-40GB HBM2  | ~106           | ~224           | n/a            |
+| NVIDIA A100-SXM4-80GB HBM2e | ~130           | ~270           | n/a            |
+| NVIDIA H100-SXM5-80GB HBM3  | ~373           | ~730           | ~1530          |
+| NVIDIA GH200 480GB HBM3e    | ~363           | ~705           | ~1660          |
+
+
 
 ## Installation
 
