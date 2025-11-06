@@ -1,4 +1,4 @@
-FROM nvidia/cuda:12.9.1-devel-ubuntu24.04 AS builder
+FROM nvidia/cuda:13.0.2-devel-ubuntu24.04 AS builder
 RUN apt-get update && apt-get install -y \
     curl \
     git \
@@ -12,6 +12,6 @@ WORKDIR /app
 COPY . .
 RUN cargo build --release
 
-FROM nvidia/cuda:12.9.1-devel-ubuntu24.04
+FROM nvidia/cuda:13.0.2-devel-ubuntu24.04
 COPY --from=builder /app/target/release/gpu-fryer /usr/local/bin/gpu-fryer
 ENTRYPOINT ["gpu-fryer"]
