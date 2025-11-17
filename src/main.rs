@@ -32,6 +32,8 @@ const GPU_THROTTLING_REASON: &str =
     "GPU is throttled. Check the throttling reasons and temperatures";
 const GPU_FLOPS_REASON: &str =
     "GPU is not performing as expected. Check the flops values and temperatures";
+const GPU_ZERO_FLOPS_REASON: &str =
+    "GPU reported 0 FLOPS, meaning it did not do any work. Check the GPU state for any XID errors and reset the GPU if needed";
 
 #[cfg(target_arch = "x86_64")]
 const NVML_DEFAULT_LIB_PATH: &str = "/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1";
@@ -590,6 +592,11 @@ fn are_gpus_healthy(
                 continue;
             }
             reasons.push(format!("GPU {} - ", r.gpu_idx) + GPU_THROTTLING_REASON);
+        }
+        // if we report 0 FLOPS, it means the GPU did not do any work due to an inconsistent state
+        // see https://github.com/huggingface/gpu-fryer/issues/10
+        if r.flops_sum == 0 {
+            reasons.push(format!("GPU {}", r.gpu_idx) + GPU_ZERO_FLOPS_REASON);
         }
     }
     (reasons.is_empty(), reasons)
