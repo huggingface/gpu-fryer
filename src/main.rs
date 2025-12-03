@@ -35,11 +35,6 @@ const GPU_FLOPS_REASON: &str =
 const GPU_ZERO_FLOPS_REASON: &str =
     "GPU reported 0 FLOPS, meaning it did not do any work. Check the GPU state for any XID errors and reset the GPU if needed";
 
-#[cfg(target_arch = "x86_64")]
-const NVML_DEFAULT_LIB_PATH: &str = "/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1";
-#[cfg(target_arch = "aarch64")]
-const NVML_DEFAULT_LIB_PATH: &str = "/usr/lib/aarch64-linux-gnu/libnvidia-ml.so.1";
-
 type AllocBufferTuple<T> = (
     CudaSlice<T>,
     CudaSlice<T>,
@@ -53,8 +48,8 @@ struct Args {
     #[clap(default_value = "60")]
     duration_secs: u64,
     /// Path to NVIDIA Management Library (libnvidia-ml.so)
-    #[clap(long, default_value = NVML_DEFAULT_LIB_PATH)]
-    nvml_lib_path: String,
+    #[clap(long)]
+    nvml_lib_path: Option<String>,
     /// Tolerate software throttling if the TFLOPS are in the acceptable range
     #[clap(long, default_value = "false")]
     tolerate_software_throttling: bool,
@@ -140,7 +135,7 @@ impl Default for BurnResult {
 #[derive(Debug, Clone)]
 struct Config {
     duration_secs: u64,
-    nvml_lib_path: String,
+    nvml_lib_path: Option<String>,
     tflops_tolerance: f64,
     tolerate_software_throttling: bool,
     use_bf16: bool,
@@ -274,7 +269,11 @@ async fn run(config: Config) -> anyhow::Result<()> {
     let stop_clone = stop.clone();
     let gpus_healthy = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let gpus_healthy_clone = gpus_healthy.clone();
-    let nvml = Nvml::builder().lib_path(config.nvml_lib_path.as_ref()).init().expect("Unable to initialize NVML. Check if the NVIDIA driver is installed and the NVIDIA Management Library is available (libnvidia-ml.so).");
+    let mut nvml_builder = Nvml::builder();
+    if let Some(ref path) = config.nvml_lib_path {
+        nvml_builder.lib_path(path.as_ref());
+    }
+    let nvml = nvml_builder.init().expect("Unable to initialize NVML. Check if the NVIDIA driver is installed and the NVIDIA Management Library is available (libnvidia-ml.so).");
     let config_clone = config.clone();
     let mut handles = Vec::new();
     let gpu_len = gpus.len();
