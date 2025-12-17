@@ -70,7 +70,7 @@ There is currently no absolute performance metric. For reference:
 | NVIDIA A100-SXM4-80GB HBM2e | ~130           | ~270           | n/a            |
 | NVIDIA H100-SXM5-80GB HBM3  | ~373           | ~730           | ~1530          |
 | NVIDIA GH200 480GB HBM3e    | ~363           | ~705           | ~1660          |
-
+| NVIDIA GB200-NVL72 186GB HBM3e    |                | ~1550          | ~4300          |
 
 
 ## Installation
