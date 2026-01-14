@@ -273,7 +273,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
     if let Some(ref path) = config.nvml_lib_path {
         nvml_builder.lib_path(path.as_ref());
     }
-    let nvml = nvml_builder.init().expect("Unable to initialize NVML. Check if the NVIDIA driver is installed and the NVIDIA Management Library is available (libnvidia-ml.so).");
+    let nvml = nvml_builder.init().expect("Unable to initialize NVML. Check if the NVIDIA driver is installed and the NVIDIA Management Library is available (libnvidia-ml.so). Use --nvml-lib-path to manually define a path.");
     let config_clone = config.clone();
     let mut handles = Vec::new();
     let gpu_len = gpus.len();
