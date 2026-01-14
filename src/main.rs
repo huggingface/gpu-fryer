@@ -120,7 +120,7 @@ impl BurnResult {
         if self.n_iters < 2 {
             0.0
         } else {
-            (self.flops_m2 / self.n_iters as f64).sqrt()
+            (self.flops_m2 / (self.n_iters - 1) as f64).sqrt()
         }
     }
 
@@ -498,7 +498,7 @@ async fn report_progress(
             }
 
             if tick > 4 {
-                // Skip the first 4 ticks to avoid caches effects
+                // Skip the first 5 ticks to avoid caches effects
                 burn_results[i].update_flops(flops);
             }
         }
