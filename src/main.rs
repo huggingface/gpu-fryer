@@ -74,6 +74,8 @@ struct BurnResult {
     flops_max: usize,
     flops_min: usize,
     flops_sum: usize,
+    flops_mean: f64,
+    flops_m2: f64, // For Welford's algorithm: sum of squared differences from mean
     n_iters: usize,
     temp_max: usize,
     temp_sum: usize,
@@ -109,6 +111,28 @@ impl BurnResult {
         }
     }
 
+    fn flops_stddev(&self) -> f64 {
+        if self.n_iters < 2 {
+            0.0
+        } else {
+            (self.flops_m2 / (self.n_iters - 1) as f64).sqrt()
+        }
+    }
+
+    /// Update running statistics + Welford's algorithm for variance
+    fn update_flops(&mut self, flops: usize) {
+        self.flops_max = self.flops_max.max(flops);
+        self.flops_min = self.flops_min.min(flops);
+        self.flops_sum += flops;
+        self.n_iters += 1;
+
+        let flops_f64 = flops as f64;
+        let delta = flops_f64 - self.flops_mean;
+        self.flops_mean += delta / self.n_iters as f64;
+        let delta2 = flops_f64 - self.flops_mean;
+        self.flops_m2 += delta * delta2;
+    }
+
     fn is_throttled(&self) -> bool {
         self.throttling_hw > 0 || self.throttling_thermal_sw > 0 || self.throttling_thermal_hw > 0
     }
@@ -121,6 +145,8 @@ impl Default for BurnResult {
             flops_max: 0,
             flops_min: usize::MAX,
             flops_sum: 0,
+            flops_mean: 0.0,
+            flops_m2: 0.0,
             n_iters: 0,
             temp_max: 0,
             temp_sum: 0,
@@ -471,11 +497,8 @@ async fn report_progress(
             }
 
             if tick > 4 {
-                // Skip the first 4 ticks to avoid caches effects
-                burn_results[i].flops_max = burn_results[i].flops_max.max(flops);
-                burn_results[i].flops_min = burn_results[i].flops_min.min(flops);
-                burn_results[i].flops_sum += flops;
-                burn_results[i].n_iters += 1;
+                // Skip the first 5 ticks to avoid caches effects
+                burn_results[i].update_flops(flops);
             }
         }
         // Report GPU temperatures
@@ -530,7 +553,7 @@ async fn report_progress(
             r.flops_avg() / 1_000_000_000.0,
             r.flops_min as f64 / 1_000_000_000.0,
             r.flops_max as f64 / 1_000_000_000.0,
-            r.flops_avg() / 1_000_000_000.0
+            r.flops_stddev() / 1_000_000_000.0
         );
         println!(
             "         Temperature: {:.2}°C (min: {:.2}, max: {:.2})",
