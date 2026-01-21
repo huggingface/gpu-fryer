@@ -15,6 +15,7 @@ use nvml_wrapper::enum_wrappers::device::TemperatureSensor::Gpu;
 use nvml_wrapper::Nvml;
 use rand::rngs::SmallRng;
 use rand::{RngCore, SeedableRng};
+use serde::Serialize;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -66,6 +67,9 @@ struct Args {
     /// Use FP8 precision. GPU must support FP8 type.
     #[clap(long)]
     use_fp8: bool,
+    /// Write final results as pretty JSON to the given file path
+    #[clap(long = "output-file")]
+    output_file: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -167,6 +171,7 @@ struct Config {
     use_bf16: bool,
     use_fp8: bool,
     use_fp32: bool,
+    output_file: Option<String>,
 }
 
 trait VariablePrecisionFloat:
@@ -213,6 +218,7 @@ async fn main() {
         use_fp32: args.use_fp32,
         use_bf16: args.use_bf16,
         use_fp8: args.use_fp8,
+        output_file: args.output_file.clone(),
     };
 
     match run(config).await {
@@ -546,6 +552,8 @@ async fn report_progress(
         }
         tick += 1;
     }
+    // Keep a copy for JSON serialization before moving the vector
+    let results_for_json = burn_results.clone();
     for r in burn_results.clone() {
         println!(
             "GPU #{}: {:6.0} Gflops/s (min: {:.2}, max: {:.2}, dev: {:.2})",
@@ -574,6 +582,53 @@ async fn report_progress(
         config.tflops_tolerance,
         config.tolerate_software_throttling,
     );
+    // If requested, write a pretty JSON report to the specified path
+    if let Some(path) = &config.output_file {
+        #[derive(Serialize)]
+        struct GpuSummary {
+            gpu_idx: usize,
+            flops_gflops_avg: f64,
+            flops_gflops_min: f64,
+            flops_gflops_max: f64,
+            temperature_celsius_avg: f64,
+            temperature_celsius_min: f64,
+            temperature_celsius_max: f64,
+            throttling_hw: bool,
+            throttling_thermal_sw: bool,
+            throttling_thermal_hw: bool,
+        }
+        #[derive(Serialize)]
+        struct JsonReport {
+            gpus: Vec<GpuSummary>,
+            healthy: bool,
+            reasons: Vec<String>,
+        }
+        let gpus = results_for_json
+            .into_iter()
+            .map(|r| GpuSummary {
+                gpu_idx: r.gpu_idx,
+                flops_gflops_avg: r.flops_avg() / 1_000_000_000.0,
+                flops_gflops_min: r.flops_min as f64 / 1_000_000_000.0,
+                flops_gflops_max: r.flops_max as f64 / 1_000_000_000.0,
+                temperature_celsius_avg: r.temp_avg(),
+                temperature_celsius_min: r.temp_min as f64,
+                temperature_celsius_max: r.temp_max as f64,
+                throttling_hw: r.throttling_hw > 0,
+                throttling_thermal_sw: r.throttling_thermal_sw > 0,
+                throttling_thermal_hw: r.throttling_thermal_hw > 0,
+            })
+            .collect::<Vec<_>>();
+        let report = JsonReport {
+            gpus,
+            healthy,
+            reasons: reasons.clone(),
+        };
+        if let Ok(file) = std::fs::File::create(path) {
+            let _ = serde_json::to_writer_pretty(file, &report);
+        } else {
+            eprintln!("Unable to create JSON output file at {}", path);
+        }
+    }
     if healthy {
         println!("All GPUs seem healthy");
     } else {
