@@ -12,12 +12,14 @@ description = "GPU fryer is a tool to stress test GPUs and detect any abnormal t
 anyhow = "1.0.95"
 clap = { version = "4.5.26", features = ["derive"] }
 cudarc = { git = "https://github.com/Hugoch/cudarc.git", branch = "feat/float8", features = ["cublas", "cublaslt", "curand", "driver", "nvrtc", "runtime", "std", "cuda-12090", "f16", "f8", "dynamic-linking"], default-features = false }
-nvml-wrapper = "0.11.0"
+nvml-wrapper = { version = "0.11.0", features = ["serde"] }
 rand = { version = "0.9.2", features = ["small_rng"] }
 tokio = { version = "1.42", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "signal"] }
 half = "2.4.1"
 float8 = { version = "0.3.0" }
 futures = "0.3.31"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0.149" }
 
 [[bin]]
 name = "gpu-fryer"

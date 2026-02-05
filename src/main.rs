@@ -15,6 +15,7 @@ use nvml_wrapper::enum_wrappers::device::TemperatureSensor::Gpu;
 use nvml_wrapper::Nvml;
 use rand::rngs::SmallRng;
 use rand::{RngCore, SeedableRng};
+use serde::Serialize;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -24,16 +25,16 @@ use tokio::sync::mpsc::{
 };
 use tokio::task::JoinHandle;
 
+use crate::log::{
+    log, log_error_and_exit, log_raw, AggregatedResults, GpuProgress, LogProblems, LogProgress,
+    LogResults,
+};
+
+mod log;
+
 const SIZE: usize = 8192; // Ensure SIZE % 16 == 0 for Tensor Core optimization
 const MEM_TO_USE_PCT: usize = 90; // Use 90% of GPU memory
 const MIN_DURATION_SECS: u64 = 10;
-
-const GPU_THROTTLING_REASON: &str =
-    "GPU is throttled. Check the throttling reasons and temperatures";
-const GPU_FLOPS_REASON: &str =
-    "GPU is not performing as expected. Check the flops values and temperatures";
-const GPU_ZERO_FLOPS_REASON: &str =
-    "GPU reported 0 FLOPS, meaning it did not do any work. Check the GPU state for any XID errors and reset the GPU if needed";
 
 type AllocBufferTuple<T> = (
     CudaSlice<T>,
@@ -41,12 +42,28 @@ type AllocBufferTuple<T> = (
     Vec<CudaSlice<<T as GpuCompute>::Out>>,
 );
 
+#[derive(Serialize, Debug)]
+pub enum BadResultReasons {
+    Throttling,
+    LowFlops,
+    ZeroFlops,
+}
+
+#[derive(Serialize)]
+pub struct GpuProblem {
+    pub gpu_idx: usize,
+    pub reason: BadResultReasons,
+}
+
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 struct Args {
     /// Duration in seconds to burn the GPUs
     #[clap(default_value = "60")]
     duration_secs: u64,
+    /// Output JSON to stdout instead of human-readable text
+    #[clap(long)]
+    json: bool,
     /// Path to NVIDIA Management Library (libnvidia-ml.so)
     #[clap(long)]
     nvml_lib_path: Option<String>,
@@ -72,7 +89,7 @@ struct Args {
     gpus: Option<Vec<usize>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Serialize, Debug, Clone)]
 struct BurnResult {
     gpu_idx: usize,
     flops_max: usize,
@@ -162,9 +179,10 @@ impl Default for BurnResult {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Serialize, Debug, Clone)]
 struct Config {
     duration_secs: u64,
+    json: bool,
     nvml_lib_path: Option<String>,
     tflops_tolerance: f64,
     tolerate_software_throttling: bool,
@@ -201,17 +219,9 @@ impl VariablePrecisionFloat for F8E4M3 {
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
-    if args.duration_secs < MIN_DURATION_SECS {
-        eprintln!("Duration must be at least {MIN_DURATION_SECS} seconds");
-        std::process::exit(1);
-    }
-    if args.tflops_tolerance < 0.0 || args.tflops_tolerance > 100.0 {
-        eprintln!("TFLOPS tolerance must be between 0 and 100");
-        std::process::exit(1);
-    }
-
     let config = Config {
         duration_secs: args.duration_secs,
+        json: args.json,
         nvml_lib_path: args.nvml_lib_path.clone(),
         tflops_tolerance: args.tflops_tolerance,
         tolerate_software_throttling: args.tolerate_software_throttling,
@@ -221,11 +231,23 @@ async fn main() {
         gpus: args.gpus,
     };
 
-    match run(config).await {
+    if args.duration_secs < MIN_DURATION_SECS {
+        log_error_and_exit(
+            config,
+            format!("Duration must be at least {MIN_DURATION_SECS} seconds"),
+        );
+    }
+    if args.tflops_tolerance < 0.0 || args.tflops_tolerance > 100.0 {
+        log_error_and_exit(
+            config,
+            format!("TFLOPS tolerance must be between 0 and 100"),
+        );
+    }
+
+    match run(config.clone()).await {
         Ok(_) => {}
         Err(e) => {
-            eprintln!("Error: {e}");
-            std::process::exit(1);
+            log_error_and_exit(config, format!("{e}"));
         }
     };
 }
@@ -249,14 +271,19 @@ async fn run(config: Config) -> anyhow::Result<()> {
     }
     // sort gpus per ordinal
     gpus.sort_by_key(|gpu| gpu.ordinal());
-    for gpu in gpus.clone() {
-        println!(
-            "Detected GPU #{}: {:?} ({})",
-            gpu.ordinal(),
-            gpu.name()?,
-            uuid_to_string(gpu.uuid()?)
-        );
-    }
+    log(
+        &config,
+        log::LogDetectedGPUs {
+            detected_gpus: gpus
+                .iter()
+                .map(|gpu| log::LogGPUInfo {
+                    index: gpu.ordinal(),
+                    name: gpu.name().unwrap_or_else(|_| "Unknown".to_string()),
+                    uuid: uuid_to_string(gpu.uuid().unwrap_or(sys::CUuuid { bytes: [0; 16] })),
+                })
+                .collect(),
+        },
+    );
     let use_fp8 = if config.use_fp8 {
         // If explicitly requested, check if all GPUs support it
         let all_support_fp8 = gpus.iter().all(|gpu| supports_fp8(gpu).unwrap_or(false));
@@ -285,13 +312,6 @@ async fn run(config: Config) -> anyhow::Result<()> {
     };
 
     let use_fp32 = config.use_fp32 || (!use_bf16 && !use_fp8);
-
-    println!(
-        "Using precision(s): {} {} {}",
-        if use_fp32 { "FP32" } else { "" },
-        if use_bf16 { "BF16" } else { "" },
-        if use_fp8 { "FP8" } else { "" }
-    );
 
     let (tx, rx) = unbounded_channel::<(usize, usize)>();
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -338,9 +358,26 @@ async fn run(config: Config) -> anyhow::Result<()> {
         .collect::<Result<HashMap<usize, usize>, anyhow::Error>>()?;
     let mem_to_use = Arc::new(mem_to_use_mb);
 
+    log(
+        &config,
+        log::LogFeatureDetection {
+            bf16: use_bf16,
+            fp8: use_fp8,
+            fp32: use_fp32,
+            gpu_memory_used: gpus
+                .iter()
+                .map(|gpu| log::LogGPUMemoryInfo {
+                    gpu_idx: gpu.ordinal(),
+                    memory_gb: mem_to_use[&gpu.ordinal()] as f64 / 1024.0,
+                })
+                .collect(),
+        },
+    );
+
     if use_bf16 {
         handles.append(
             &mut run_with_precision::<half::bf16>(
+                &config,
                 gpus.clone(),
                 mem_to_use.clone(),
                 tx.clone(),
@@ -352,6 +389,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
     if use_fp8 {
         handles.append(
             &mut run_with_precision::<F8E4M3>(
+                &config,
                 gpus.clone(),
                 mem_to_use.clone(),
                 tx.clone(),
@@ -362,8 +400,14 @@ async fn run(config: Config) -> anyhow::Result<()> {
     }
     if use_fp32 {
         handles.append(
-            &mut run_with_precision::<f32>(gpus, mem_to_use.clone(), tx.clone(), stop.clone())
-                .await,
+            &mut run_with_precision::<f32>(
+                &config,
+                gpus,
+                mem_to_use.clone(),
+                tx.clone(),
+                stop.clone(),
+            )
+            .await,
         );
     }
 
@@ -393,6 +437,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
 }
 
 async fn run_with_precision<T: VariablePrecisionFloat + GpuCompute>(
+    config: &Config,
     gpus: Vec<Arc<CudaContext>>,
     mem_to_use_mb: Arc<HashMap<usize, usize>>,
     tx: Sender<(usize, usize)>,
@@ -402,7 +447,7 @@ where
     CudaBlasLT: Matmul<T>,
 {
     // create 2 matrix with random values
-    println!("Creating random matrices");
+    log_raw(config, "Creating random matrices");
     // use SmallRng to create random values, we don't need cryptographic security but we need speed
     let mut small_rng = SmallRng::from_rng(&mut rand::rng());
     let mut a = vec![T::from_f32(0.0); SIZE * SIZE];
@@ -412,7 +457,7 @@ where
         a[i] = T::from_f32(small_rng.next_u32() as f32);
         b[i] = T::from_f32(small_rng.next_u32() as f32);
     }
-    println!("Matrices created");
+    log_raw(config, "Matrices created");
 
     let mut handles = Vec::new();
     for gpu in gpus.clone() {
@@ -506,110 +551,77 @@ async fn report_progress(
         if nops.iter().all(|&x| x == 0) {
             continue;
         }
+        let temps = poll_temperatures(&nvml, gpu_count).expect("Unable to poll temperatures");
+        let throttling = poll_throttling(&nvml, gpu_count).expect("Unable to poll throttling");
         for i in 0..gpu_count {
             let flops = nops[i] * SIZE * SIZE * SIZE * 2;
-            print!("{} ({} Gflops/s)", nops[i], flops / 1_000_000_000);
-            if i < gpu_count - 1 {
-                print!(" - ");
-            } else {
-                print!(" | ");
+
+            match throttling[i] {
+                ThrottleReasons::SW_THERMAL_SLOWDOWN => {
+                    burn_results[i].throttling_thermal_sw += 1;
+                }
+                ThrottleReasons::HW_THERMAL_SLOWDOWN => {
+                    burn_results[i].throttling_thermal_hw += 1;
+                }
+                ThrottleReasons::HW_SLOWDOWN => {
+                    burn_results[i].throttling_hw += 1;
+                }
+                _ => {}
             }
 
             if tick > 4 {
                 // Skip the first 5 ticks to avoid caches effects
                 burn_results[i].update_flops(flops);
-            }
-        }
-        // Report GPU temperatures
-        let temps = poll_temperatures(&nvml, gpu_count).expect("Unable to poll temperatures");
-        print!("Temperatures: ");
-        for i in 0..gpu_count {
-            print!("{}°C", temps[i]);
-            if i < gpu_count - 1 {
-                print!(" - ");
-            } else {
-                print!(" | ");
-            }
-            if tick > 4 {
                 burn_results[i].temp_max = burn_results[i].temp_max.max(temps[i]);
                 burn_results[i].temp_min = burn_results[i].temp_min.min(temps[i]);
                 burn_results[i].temp_sum += temps[i];
             }
-        }
-        // Report throttling
-        let throttling = poll_throttling(&nvml, gpu_count).expect("Unable to poll throttling");
-        print!("Throttling: ");
-        for i in 0..gpu_count {
-            match throttling[i] {
-                ThrottleReasons::SW_THERMAL_SLOWDOWN => {
-                    print!("Thermal SW");
-                    burn_results[i].throttling_thermal_sw += 1;
-                }
-                ThrottleReasons::HW_THERMAL_SLOWDOWN => {
-                    print!("Thermal HW");
-                    burn_results[i].throttling_thermal_hw += 1;
-                }
-                ThrottleReasons::HW_SLOWDOWN => {
-                    print!("HW slowdown");
-                    burn_results[i].throttling_hw += 1;
-                }
-                _ => {
-                    print!("None");
-                }
-            }
-            if i < gpu_count - 1 {
-                print!(" - ");
-            } else {
-                println!();
-            }
+
+            let log_progress = LogProgress {
+                gpus: burn_results
+                    .iter()
+                    .map(|r| GpuProgress {
+                        gpu_idx: r.gpu_idx,
+                        flops: flops,
+                        nops: nops[i],
+                        temp_celsius: temps[i],
+                        throttle_reason: throttling[i],
+                    })
+                    .collect(),
+            };
+            log(&config, log_progress);
         }
         tick += 1;
     }
-    for r in burn_results.clone() {
-        println!(
-            "GPU #{}: {:6.0} Gflops/s (min: {:.2}, max: {:.2}, dev: {:.2})",
-            r.gpu_idx,
-            r.flops_avg() / 1_000_000_000.0,
-            r.flops_min as f64 / 1_000_000_000.0,
-            r.flops_max as f64 / 1_000_000_000.0,
-            r.flops_stddev() / 1_000_000_000.0
-        );
-        println!(
-            "         Temperature: {:.2}°C (min: {:.2}, max: {:.2})",
-            r.temp_avg(),
-            r.temp_min as f64,
-            r.temp_max as f64
-        );
-        println!(
-            "         Throttling HW: {}, Thermal SW: {}, Thermal HW: {}",
-            r.throttling_hw > 0,
-            r.throttling_thermal_sw > 0,
-            r.throttling_thermal_hw > 0
-        );
-    }
 
-    let (healthy, reasons) = are_gpus_healthy(
+    let log_results = LogResults {
+        gpus: burn_results
+            .clone()
+            .into_iter()
+            .map(|r| AggregatedResults {
+                burn_result: r.clone(),
+                flops_avg: r.flops_avg(),
+            })
+            .collect(),
+    };
+    log(&config, log_results);
+
+    let reasons = are_gpus_healthy(
         burn_results,
         config.tflops_tolerance,
         config.tolerate_software_throttling,
     );
-    if healthy {
-        println!("All GPUs seem healthy");
-    } else {
-        println!("Some GPUs are not healthy. Reasons:");
-        for r in reasons {
-            println!("  - {r}");
-        }
-    }
+    let healthy = reasons.is_empty();
+    log(&config, LogProblems { problems: reasons });
     gpus_healthy.store(healthy, std::sync::atomic::Ordering::Relaxed);
-    println!("Freeing GPUs...");
+    log_raw(&config, "Freeing GPUs...");
 }
 
 fn are_gpus_healthy(
     burn_results: Vec<BurnResult>,
     tflops_tolerance: f64,
     tolerate_software_throttling: bool,
-) -> (bool, Vec<String>) {
+) -> Vec<GpuProblem> {
     let mut reasons = vec![];
     // acceptable_flops is tflops_tolerance% lower than best gpu avg flops
     let acceptable_flops: f64 = burn_results
@@ -621,7 +633,10 @@ fn are_gpus_healthy(
     for r in burn_results.iter() {
         let mut low_flops = false;
         if r.flops_avg() < acceptable_flops {
-            reasons.push(format!("GPU {} - ", r.gpu_idx) + GPU_FLOPS_REASON);
+            reasons.push(GpuProblem {
+                gpu_idx: r.gpu_idx,
+                reason: BadResultReasons::LowFlops,
+            });
             low_flops = true;
         }
         // if we have any throttling
@@ -632,15 +647,21 @@ fn are_gpus_healthy(
             {
                 continue;
             }
-            reasons.push(format!("GPU {} - ", r.gpu_idx) + GPU_THROTTLING_REASON);
+            reasons.push(GpuProblem {
+                gpu_idx: r.gpu_idx,
+                reason: BadResultReasons::Throttling,
+            });
         }
         // if we report 0 FLOPS, it means the GPU did not do any work due to an inconsistent state
         // see https://github.com/huggingface/gpu-fryer/issues/10
         if r.flops_sum == 0 {
-            reasons.push(format!("GPU {}", r.gpu_idx) + GPU_ZERO_FLOPS_REASON);
+            reasons.push(GpuProblem {
+                gpu_idx: r.gpu_idx,
+                reason: BadResultReasons::ZeroFlops,
+            });
         }
     }
-    (reasons.is_empty(), reasons)
+    reasons
 }
 
 trait GpuCompute: VariablePrecisionFloat {
@@ -705,7 +726,6 @@ where
 {
     let gpu = CudaContext::new(gpu_idx)?;
     // compute the output matrix size
-    println!("GPU #{gpu_idx}: Using {mem_to_use_mb} MB");
     let iters = (mem_to_use_mb * 1024 * 1024 - 2 * SIZE * SIZE * get_memory_size::<T::Out>())
         / (SIZE * SIZE * get_memory_size::<T::Out>());
     let (a_gpu, b_gpu, mut out_slices_gpu) = alloc_buffers::<T>(gpu.clone(), a, b, iters)?;
