@@ -16,18 +16,18 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
       - name: Inject slug/short variables
-        uses: rlespinasse/github-slug-action@102b1a064a9b145e56556e22b18b19c624538d94  # v4.4.1
+        uses: rlespinasse/github-slug-action@102b1a064a9b145e56556e22b18b19c624538d94
       - name: Initialize Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
         with:
           install: true
           buildkitd-config: /tmp/buildkitd.toml
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130  # v3
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130
         with:
           platforms: 'arm64'
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -36,7 +36,7 @@ jobs:
       - name: Extract metadata (tags, labels) for Docker
         if: ${{ github.event_name == 'pull_request' }}
         id: meta-pr
-        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051  # v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051
         with:
           images: |
             ghcr.io/huggingface/gpu-fryer
@@ -46,7 +46,7 @@ jobs:
       - name: Extract metadata (tags, labels) for Docker
         if: ${{ github.event_name != 'pull_request' }}
         id: meta
-        uses: docker/metadata-action@507c2f2dc502c992ad446e3d7a5dfbe311567a96  # v4.3.0
+        uses: docker/metadata-action@507c2f2dc502c992ad446e3d7a5dfbe311567a96
         with:
           flavor: |
             latest=auto
@@ -59,7 +59,7 @@ jobs:
             type=raw,value=sha-${{ env.GITHUB_SHA_SHORT }}
       - name: Build and push Docker image
         id: build-and-push
-        uses: docker/build-push-action@0a97817b6ade9f46837855d676c4cca3a2471fc9  # v4
+        uses: docker/build-push-action@0a97817b6ade9f46837855d676c4cca3a2471fc9
         with:
           context: .
           file: ${{ env.DOCKERFILE }}
