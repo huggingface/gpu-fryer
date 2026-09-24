@@ -3,8 +3,12 @@ name: Secret Leaks
 on:
   push:
 
+permissions: {}
+
 jobs:
   trufflehog:
+    permissions:
+      contents: read
     runs-on:
       group: aws-general-8-plus
     steps:
